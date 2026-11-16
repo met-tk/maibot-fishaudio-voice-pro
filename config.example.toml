@@ -1,0 +1,127 @@
+# Fish Audio TTS 与音色克隆 MaiBot 插件配置示例
+# 将本文件复制为 config.toml 并填入你的 Fish Audio API Key 即可使用。
+
+[plugin]
+enabled = true
+config_version = "1.0.0"
+
+[voice]
+# Fish Audio API Key（Bearer Token），请在 https://fish.audio 控制台获取
+fish_api_key = ""
+# Fish Audio TTS 接口地址（支持填写基础域名如 https://api.fish.audio 或完整 /v1/tts）
+api_base_url = "https://api.fish.audio/v1/tts"
+# 请求头 model 字段：可选 s2.1-pro-free / s2.1-pro / s2-pro / drama-3 / s1
+model = "s2.1-pro-free"
+# 音色策略：auto | reference_id | clone | default
+# auto 顺序：若填写 reference_id 则用云端音色 -> 否则查找 voices_dir 本地克隆 -> 否则用模型默认音色
+voice_mode = "auto"
+# Fish Audio 云端音色 ID（支持单个 ID 或逗号分隔多音色如 id1,id2，留空使用默认/本地）
+reference_id = ""
+# 本地参考音频目录（支持 .wav/.mp3/.flac/.ogg/.opus/.m4a 与同名 .txt 台词文本）
+voices_dir = "voices"
+# 指定本地克隆音色名（不含扩展名）；留空时优先选 default，否则取首个音频
+clone_voice = ""
+# 输出音频格式：mp3 | wav | pcm | opus（聊天平台语音发送推荐 mp3）
+audio_format = "mp3"
+# 采样率（0 表示服务端默认：WAV/PCM 为 44100，Opus 为 48000）
+sample_rate = 0
+# MP3 比特率（kbps：64 | 128 | 192）
+mp3_bitrate = 128
+# Opus 比特率（-1000 表示自动，或 24000 | 32000 | 48000 | 64000）
+opus_bitrate = -1000
+
+[auto_voice]
+# 开启后默认将所有符合条件的出站纯文本回复自动合成为语音发送（不依赖大模型主动调用语音工具）
+enabled = true
+# 遇到多句或较长文本时，按句子标点与单段字数上限自动拆分并依次分段发送语音
+split_sentences = true
+# 分段发送时每段语音允许的最大字符数（15 - 300）
+max_segment_chars = 80
+# 多段连续发送语音时，每段之间的额外间隔毫秒数（0 - 3000）
+segment_delay_ms = 200
+# 允许触发自动转语音的最短文本字符数
+min_text_length = 1
+# 单次消息允许自动转语音的最大总字符数（超出将保留为纯文本防止超时）
+max_text_length = 500
+# 消息包含 http(s) 网址或代码块时保持纯文本不转语音
+skip_urls_and_code = true
+
+[storage]
+# 是否保存每次生成的输出语音文件到本地；默认 false（仅内存经 Base64 传输，不在磁盘留存历史音频；
+# 本地 ffmpeg 调音产生的临时目录也总会在调音结束后立即自动删除）
+save_output_audio = false
+# 开启保存后输出语音文件的存储目录（相对插件目录或绝对路径）
+output_dir = "output_audio"
+# 是否开启自动清理（仅清理本插件生成的 fishaudio_* 音频文件）
+auto_delete = true
+# 文件保留时长（分钟）：0 表示发送完毕后立即删除；>0 表示保留指定分钟数并自动清理过期文件
+retain_minutes = 60
+# 输出目录最多保留的插件语音文件数（0 表示不限数量；超出时从旧到新清理）
+max_saved_files = 100
+
+[generation]
+# 延迟模式：balanced | normal | low
+latency = "balanced"
+# 采样随机度（0.0 - 1.0）
+temperature = 0.7
+# 核采样阈值（0.0 - 1.0）
+top_p = 0.7
+# 重复惩罚系数（0.5 - 2.0）
+repetition_penalty = 1.2
+# 单次分块参考长度（100 - 300）
+chunk_length = 300
+# 最小分块阈值（0 - 100）
+min_chunk_length = 50
+# 是否自动规范化数字、日期、缩写等朗读文本
+normalize = true
+# BCP-47 语言代码提示（如 zh、en、ja），留空自动检测
+language = ""
+# 长文本多段之间是否继承韵律上下文
+condition_on_previous_chunks = true
+# 单次合成最大生成 token 数
+max_new_tokens = 1024
+# 静音早停阈值（0.0 - 1.0）
+early_stop_threshold = 1.0
+# 云端语速倍率（0.5 - 2.0，送入 prosody.speed）
+prosody_speed = 1.0
+# 云端音量调节（dB，-20.0 - 20.0，送入 prosody.volume）
+prosody_volume = 0.0
+# 是否开启云端响度归一化（送入 prosody.normalize_loudness）
+prosody_normalize_loudness = true
+
+[request]
+# 单次 HTTP 总超时（秒）
+request_timeout = 90.0
+# 建连超时（秒）
+connect_timeout = 10.0
+# 响应体静默超时（秒，0 表示不限制）
+stall_timeout = 30.0
+# 可恢复错误（429/5xx/网络波动）最大重试次数
+max_retries = 2
+# 重试退避基数（秒）
+retry_backoff = 1.5
+# TTS 合成最大并发数
+max_concurrency = 1
+
+[fallback]
+# TTS 合成或发送失败时自动降级发送纯文字
+fallback_to_text = true
+# 台词剥离情感标签后为空时的保底文字
+empty_text_placeholder = "（想说点什么，但声音没发出来）"
+# 降级发送纯文字前是否剥离 [laughing] / （轻笑） 等副语言舞台指示标签
+strip_audio_tags = true
+# 并发槽位已满时是否直接跳过合成并改发纯文字
+skip_when_busy = true
+
+[audio]
+# 以下为本地 ffmpeg 调音参数，全部默认关闭（关闭时不调用 ffmpeg）
+ffmpeg_path = "ffmpeg"
+pitch_semitones = 0.0
+preserve_formant = true
+speed = 1.0
+loudness_normalize = false
+loudness_target = -16.0
+highpass_hz = 0
+volume_db = 0.0
+fade_ms = 0
+trim_silence = false

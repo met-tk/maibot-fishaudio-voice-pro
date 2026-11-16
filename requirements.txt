@@ -1,0 +1,4 @@
+# 插件自身的第三方依赖。
+# 不在此重复声明 maibot-plugin-sdk，避免干扰宿主环境版本。
+aiohttp>=3.8.0
+msgpack>=1.0.0
