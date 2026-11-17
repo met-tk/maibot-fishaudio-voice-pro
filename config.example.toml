@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [voice]
 # Fish Audio API Key（Bearer Token），请在 https://fish.audio 控制台获取
@@ -31,17 +31,29 @@ mp3_bitrate = 128
 opus_bitrate = -1000
 
 [auto_voice]
-# 开启后默认将所有符合条件的出站纯文本回复自动合成为语音发送（不依赖大模型主动调用语音工具）
-enabled = true
+# 语音触发模式：
+# - planner：由 MaiBot Planner 自行识别对话语境并决定是否发送语音（推荐）
+# - probability：纯随机概率模式，按 random_probability 随机将出站纯文本转为语音
+# - always：全局全转语音（所有符合条件的出站纯文本均转为语音）
+# - off：关闭自动与 Planner 主动触发（仅保留显式 API 或手动调用）
+mode = "planner"
+# Planner 语音温度滑块（0.0 - 1.0，步长 0.05，仅 mode = "planner" 生效）：
+# 0.0 仅用户明确要求语音时触发；0.5 均衡自主判断；1.0 极高倾向选用语音
+planner_temperature = 0.5
+# 纯随机概率滑块（0.0 - 1.0，步长 0.05，仅 mode = "probability" 生效）：
+# 0.0 不转换，0.5 约半数转换，1.0 全部转换
+random_probability = 0.5
+# 纯随机模式下同一会话的短时决策缓存时长（秒，0 表示关闭缓存，用于防止分段回复语音文字混发）
+decision_ttl_seconds = 8.0
 # 遇到多句或较长文本时，按句子标点与单段字数上限自动拆分并依次分段发送语音
 split_sentences = true
 # 分段发送时每段语音允许的最大字符数（15 - 300）
 max_segment_chars = 80
 # 多段连续发送语音时，每段之间的额外间隔毫秒数（0 - 3000）
 segment_delay_ms = 200
-# 允许触发自动转语音的最短文本字符数
+# 允许转为语音的最短文本字符数
 min_text_length = 1
-# 单次消息允许自动转语音的最大总字符数（超出将保留为纯文本防止超时）
+# 单次消息允许转为语音的最大总字符数（超出将保留为纯文本防止超时）
 max_text_length = 500
 # 消息包含 http(s) 网址或代码块时保持纯文本不转语音
 skip_urls_and_code = true

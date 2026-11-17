@@ -107,6 +107,8 @@ class FishAudioTTSService:
         self.api_base_url = resolve_tts_endpoint(api_base_url)
         self.logger = logger or logging.getLogger(__name__)
         self._session: Optional[aiohttp.ClientSession] = None
+        self._retired_sessions: list[Any] = []
+        self._inflight_requests: int = 0
         self._semaphore: Optional[asyncio.Semaphore] = None
         self._max_concurrency = 1
         self._update_limits(
@@ -287,18 +289,60 @@ class FishAudioTTSService:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ttl_dns_cache=10)
             self._session = aiohttp.ClientSession(
+                connector=connector,
+                trust_env=True,
                 timeout=aiohttp.ClientTimeout(
                     total=None,
                     sock_connect=self.connect_timeout,
-                )
+                ),
             )
         return self._session
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        sessions: list[Any] = []
+        if self._session is not None:
+            sessions.append(self._session)
             self._session = None
+        if self._retired_sessions:
+            sessions.extend(self._retired_sessions)
+            self._retired_sessions.clear()
+        for session in sessions:
+            if session is not None and not getattr(session, "closed", True):
+                await session.close()
+
+    async def _flush_retired_sessions(self) -> None:
+        if self._inflight_requests > 0 or not self._retired_sessions:
+            return
+        pending = list(self._retired_sessions)
+        self._retired_sessions.clear()
+        for session in pending:
+            if session is not None and not getattr(session, "closed", True):
+                await session.close()
+
+    async def _discard_session(self, session: Any) -> None:
+        """发生网络或建连异常时替换陈旧连接池；存在在途并发请求时延后安全关闭。"""
+        if session is None:
+            return
+        if self._session is session:
+            self._session = None
+        if getattr(session, "closed", True):
+            return
+        if self._inflight_requests <= 0:
+            await session.close()
+        elif session not in self._retired_sessions:
+            self._retired_sessions.append(session)
+
+    @staticmethod
+    def _format_client_error(exc: Exception) -> str:
+        detail = str(exc).strip()
+        os_error = getattr(exc, "os_error", None)
+        if os_error is not None:
+            errno = getattr(os_error, "winerror", None) or getattr(os_error, "errno", None)
+            if "[None]" in detail or not detail:
+                return f"{type(exc).__name__}: {detail or repr(exc)} (os_error={os_error!r}, errno={errno})"
+        return detail or repr(exc)
 
     async def _do_request(
         self,
@@ -322,26 +366,42 @@ class FishAudioTTSService:
                 )
                 await asyncio.sleep(delay)
 
+            session: Any = None
             try:
                 async with self._get_semaphore():
                     session = await self._get_session()
-                    async with session.post(
-                        self.api_base_url,
-                        data=body_bytes,
-                        headers=headers,
-                        timeout=self._build_timeout(),
-                    ) as response:
-                        if response.status == 200:
-                            return await self._parse_response(response, text_content)
+                    self._inflight_requests += 1
+                    try:
+                        async with session.post(
+                            self.api_base_url,
+                            data=body_bytes,
+                            headers=headers,
+                            timeout=self._build_timeout(),
+                        ) as response:
+                            if response.status == 200:
+                                return await self._parse_response(response, text_content)
 
-                        error_body = await response.read()
-                        last_error = self._format_http_error(response.status, error_body)
-                        self.logger.error("Fish Audio TTS API failed: %s", last_error)
-                        if response.status not in self.RETRYABLE_STATUS:
-                            return {"success": False, "error": last_error}
-                        continue
+                            error_body = await response.read()
+                            last_error = self._format_http_error(response.status, error_body)
+                            self.logger.error("Fish Audio TTS API failed: %s", last_error)
+                            if response.status not in self.RETRYABLE_STATUS:
+                                return {"success": False, "error": last_error}
+                            continue
+                    finally:
+                        self._inflight_requests = max(0, self._inflight_requests - 1)
 
+            except aiohttp.ConnectionTimeoutError as exc:
+                last_error = f"Connect timeout ({self.connect_timeout}s): {self._format_client_error(exc)}"
+                self.logger.warning(
+                    "Fish Audio TTS 建连超时 (%d/%d): %s",
+                    attempt + 1,
+                    attempts,
+                    last_error,
+                )
+                await self._discard_session(session)
+                continue
             except (asyncio.TimeoutError, TimeoutError):
+                await self._discard_session(session)
                 self.logger.warning(
                     "Fish Audio TTS 超时（整体 %ss / 传输空闲 %ss），放弃本次语音合成",
                     self.request_timeout,
@@ -349,12 +409,15 @@ class FishAudioTTSService:
                 )
                 return {"success": False, "error": self._timeout_error_text()}
             except aiohttp.ClientError as exc:
-                last_error = f"Network error: {exc}"
-                self.logger.error("Fish Audio TTS network error: %s", exc)
+                last_error = f"Network error: {self._format_client_error(exc)}"
+                self.logger.error("Fish Audio TTS network error: %s", last_error)
+                await self._discard_session(session)
                 continue
             except Exception as exc:
                 self.logger.error("Fish Audio TTS error: %s", exc)
                 return {"success": False, "error": str(exc)}
+            finally:
+                await self._flush_retired_sessions()
 
         return {"success": False, "error": last_error}
 

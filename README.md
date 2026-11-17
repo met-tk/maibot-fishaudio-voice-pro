@@ -20,8 +20,9 @@
 4. **云端与本地双重调音**
    - 支持服务端 `prosody`（语速、音量、响度归一化）及采样生成参数。
    - 可选本地 `ffmpeg` 滤镜链（变调、保持共振峰、EBU R128 响度归一化、高通滤波、裁剪静音等），默认全关零额外开销。
-5. **默认全局文字转语音与智能分段发送**
-   - 新增 `[auto_voice]` 配置段，默认 `enabled = true`：无需依赖大模型每次显式调工具，出站纯文本回复自动经 Fish Audio 转为语音；遇到长段文本自动按句拆分为多段依次发出，并自动跳过链接与代码块。
+5. **多种语音触发策略与双滑块调节**
+   - `[auto_voice]` 支持四种触发模式：`planner`（由 MaiBot Planner 根据语境自主决策是否发语音，推荐默认）、`probability`（纯随机概率模式）、`always`（全量出站文字自动转语音）、`off`（关闭自动与 Planner 主动触发）。
+   - 提供两个独立的 WebUI 原生滑块：`planner_temperature`（Planner 语音温度，`0.0 - 1.0`）与 `random_probability`（纯随机概率，`0.0 - 1.0`），配合长文本按句分段发送及链接/代码块自动跳过。
 6. **可控的输出语音存储与自动清理**
    - 新增 `[storage]` 配置段：默认 `save_output_audio = false`，音频全程在内存经 Base64 传输，不在磁盘保留历史语音文件；本地 `ffmpeg` 调音临时目录亦会在处理后立即删除。若需要将生成语音留档或排查，可开启 `save_output_audio = true` 指定 `output_dir`，并通过 `auto_delete`、`retain_minutes`（含设为 `0` 时发送后立即删除）与 `max_saved_files` 控制自动清理。
 
@@ -65,8 +66,10 @@ audio_format = "mp3"
 
 ## 暴露组件
 
-- `@HookHandler("send_service.before_send")`（`fish_auto_voice`）：当 `[auto_voice].enabled = true`（默认开启）时，自动将出站纯文本按句/长度分段转为 `voice` 消息发送，失败自动放行纯文本。
-- `@Tool("send_voice_reply")`：供 MaiBot 对话决策显式调用的语音回复工具（参数：`text` 必填，`voice` / `style` 可选）。
+- `@ReplyExtension("voice_reply")`：融入 MaiBot 原生 `reply` / `reply_supplement` 流程，在 `mode = "planner"` 时由 Planner 自行决定是否选用语音并可附带情绪风格提示；合成失败时自动无损保留原文字。
+- `@HookHandler("maisaka.planner.before_request")`（`fish_planner_voice_policy`）：在 `planner` 模式下按 `planner_temperature` 动态注入语音决策引导；在非 `planner` 模式下自动隐藏语音扩展与直发工具，避免误触发。
+- `@HookHandler("send_service.before_send")`（`fish_auto_voice`）：在 `mode = "always"` 或 `"probability"` 时按策略将出站纯文本按句/长度分段转为 `voice` 消息发送，失败自动放行纯文本；同时清理语音消息上不兼容的引用标记。
+- `@Tool("send_voice_reply")`（`visibility="visible"`）：供 MaiBot 对话决策直接显式调用的语音回复工具（参数：`text` 必填，`voice` / `style` 可选）。
 - `@API("fish_tts")`：供其他插件跨插件调用的公共合成接口，返回 `{success, audio_base64, audio_bytes_len, format, model, voice, text}`（开启 `[storage].save_output_audio` 且 `retain_minutes > 0` 时附带 `audio_path`）。
 
 

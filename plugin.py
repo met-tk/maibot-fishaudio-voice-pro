@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import logging
+import random
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Optional, Sequence
 
+import maibot_sdk
 from maibot_sdk import (
     API,
     CONFIG_RELOAD_SCOPE_SELF,
@@ -28,6 +32,15 @@ from maibot_sdk import (
     Tool,
 )
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
+from pydantic import model_validator
+
+ReplyExtension = getattr(maibot_sdk, "ReplyExtension", None)
+if ReplyExtension is None:  # pragma: no cover - 兼容旧版 SDK 降级占位
+    def ReplyExtension(*_args: Any, **_kwargs: Any):  # type: ignore[no-redef]
+        def _noop_decorator(func: Any) -> Any:
+            return func
+
+        return _noop_decorator
 
 from .audio_processor import (
     DEFAULT_PCM_SAMPLE_RATE,
@@ -50,6 +63,38 @@ _NON_BODY_SEGMENTS = frozenset({"at", "reply", "face"})
 _MEDIA_DICT_TYPES = frozenset({"voiceurl", "imageurl", "videourl", "record", "image", "video", "file", "music"})
 _FALLBACK_BYPASS_TTL_SECONDS = 15.0
 _OUTPUT_FILE_NAME_RE = re.compile(r"^fishaudio_\d{8}_\d{6}_[0-9a-f]{8}\.(mp3|wav|opus|pcm)$")
+_VOICE_REPLY_EXTENSION_NAME = "voice_reply"
+_DEFAULT_VOICE_EXTENSION_FULL_NAME = f"custom.maibot-fishaudio-voice-pro.{_VOICE_REPLY_EXTENSION_NAME}"
+_PLANNER_VOICE_ITEM_PREFIX = "fishaudio-voice-planner-"
+_AUTO_VOICE_MODES = frozenset({"planner", "probability", "always", "off"})
+_UNSUITABLE_TEXT_PATTERNS = ("http://", "https://", "```", "![", "|--")
+_PLANNER_TEMPERATURE_TIERS: tuple[tuple[float, str, str], ...] = (
+    (
+        0.0,
+        "极度克制（仅明确要求）",
+        "仅当用户明确要求发送语音（例如“发条语音/念给我听”）或对方刚发来语音且适合用语音回敬时，才启用语音扩展并设置 explicit_request=true；其余所有情况一律保持纯文字回复。",
+    ),
+    (
+        0.3,
+        "低频克制",
+        "日常回复默认以文字为主；仅在撒娇、安慰情绪、道晚安、表达想念、简短接梗吐槽或回应对方语音等高情绪契合场景才启用语音扩展，并如实评估 suitability（0.0-1.0）。",
+    ),
+    (
+        0.65,
+        "均衡自然",
+        "结合语境与表达自然度自行权衡：口语感强、带情绪互动或简短问候的回复可积极启用语音扩展；涉及长段说明、步骤教程、代码、链接或客观资料检索时请坚持用文字回复。",
+    ),
+    (
+        0.95,
+        "高频倾诉",
+        "只要回复内容适合口语朗读（篇幅适中、非代码/网址/列表/长篇科普），请优先启用语音扩展发送语音；仅偏书面或结构化信息保留纯文字。",
+    ),
+    (
+        1.0,
+        "极高倾向",
+        "除明显不适合语音朗读的内容（长文、代码块、链接、数据表格）外，积极主动选用语音扩展替代纯文字回复。",
+    ),
+)
 
 _STYLE_BLOCK_RE = re.compile(r"<style>.*?</style>", re.IGNORECASE | re.DOTALL)
 _SQUARE_TAG_RE = re.compile(r"\[[^\]\r\n]{1,48}\]")
@@ -74,7 +119,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "order": 1},
     )
     config_version: str = Field(
-        default="1.0.0",
+        default="1.1.0",
         description="配置文件版本号",
         json_schema_extra={"label": "配置版本", "order": 2},
     )
@@ -393,53 +438,118 @@ class AudioSectionConfig(PluginConfigBase):
 
 
 class AutoVoiceSectionConfig(PluginConfigBase):
-    """全局默认文字转语音与分段发送配置。"""
+    """语音触发策略、Planner 自主决策、概率控制与分段发送配置。"""
 
-    __ui_label__ = "全局默认语音与分段"
+    __ui_label__ = "语音触发与分段"
 
-    enabled: bool = Field(
-        default=True,
-        description="开启后默认将所有符合条件的出站纯文本回复自动转为语音发送",
-        json_schema_extra={"label": "默认启用语音回复", "order": 1},
+    mode: Literal["planner", "probability", "always", "off"] = Field(
+        default="planner",
+        description=(
+            "语音发送触发模式：planner（由 Planner 根据对话语境自行决定是否发语音）、"
+            "probability（按设定概率随机将符合条件的纯文本转为语音）、"
+            "always（所有符合条件的出站纯文本全部转为语音）、"
+            "off（关闭自动与 Planner 触发，仅保留 API 或手动调用）"
+        ),
+        json_schema_extra={
+            "label": "语音触发模式",
+            "order": 1,
+            "hint": "推荐 planner：由 Planner 自主识别语境决定是否发语音；也可选纯随机概率、全量或关闭",
+            "i18n": {
+                "zh-CN": {
+                    "choice:planner": "Planner 自主判断 (planner)",
+                    "choice:probability": "纯随机概率 (probability)",
+                    "choice:always": "全局全转语音 (always)",
+                    "choice:off": "关闭自动触发 (off)",
+                }
+            },
+        },
+    )
+    planner_temperature: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Planner 模式下控制模型主动选用语音的倾向温度（0.0 - 1.0）："
+            "0.0 仅当用户明确要求语音时触发；0.5 均衡自然；1.0 极高倾向语音"
+        ),
+        json_schema_extra={
+            "label": "Planner 温度滑块",
+            "x-widget": "slider",
+            "step": 0.05,
+            "order": 2,
+            "hint": "仅 mode=planner 生效；数值越高，Planner 越积极启用语音回复，同时放宽契合度阈值",
+        },
+    )
+    random_probability: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="纯随机概率模式（mode=probability）下出站纯文本自动转为语音的概率（0.0 - 1.0）",
+        json_schema_extra={
+            "label": "纯随机概率滑块",
+            "x-widget": "slider",
+            "step": 0.05,
+            "order": 3,
+            "hint": "仅 mode=probability 生效；0.0 不转换，0.5 约半数转换，1.0 全部转换",
+        },
+    )
+    decision_ttl_seconds: float = Field(
+        default=8.0,
+        ge=0.0,
+        le=60.0,
+        description="纯随机概率模式下同一会话在多少秒内复用同一次随机决策（避免一条长回复拆段后语音与文字混发，0 表示关闭缓存）",
+        json_schema_extra={"label": "随机决策缓存时长（秒）", "order": 4},
     )
     split_sentences: bool = Field(
         default=True,
         description="遇到多句或较长文本时按句拆分为多条语音依次分段发送",
-        json_schema_extra={"label": "长文本分段发送", "order": 2},
+        json_schema_extra={"label": "长文本分段发送", "order": 5},
     )
     max_segment_chars: int = Field(
         default=80,
         ge=15,
         le=300,
         description="分段发送时单条语音允许的最大字符数（超出则按标点继续拆段）",
-        json_schema_extra={"label": "单段最大字数", "order": 3},
+        json_schema_extra={"label": "单段最大字数", "order": 6},
     )
     segment_delay_ms: int = Field(
         default=200,
         ge=0,
         le=3000,
         description="连续发送多段语音时每段之间的间隔毫秒数（0 表示无额外等待）",
-        json_schema_extra={"label": "分段发送间隔 (ms)", "order": 4},
+        json_schema_extra={"label": "分段发送间隔 (ms)", "order": 7},
     )
     min_text_length: int = Field(
         default=1,
         ge=1,
         le=50,
-        description="自动转为语音的最短文本字符数",
-        json_schema_extra={"label": "最小转换字数", "order": 5},
+        description="自动/扩展转为语音的最短文本字符数",
+        json_schema_extra={"label": "最小转换字数", "order": 8},
     )
     max_text_length: int = Field(
         default=500,
         ge=20,
         le=4000,
-        description="允许自动转语音的单条原始消息最大总字数（超出则保持纯文本避免超时）",
-        json_schema_extra={"label": "最大转换字数", "order": 6},
+        description="允许转为语音的单条原始消息最大总字数（超出则保持纯文本避免超时）",
+        json_schema_extra={"label": "最大转换字数", "order": 9},
     )
     skip_urls_and_code: bool = Field(
         default=True,
         description="消息正文包含网址链接或代码块时保持纯文本不转语音",
-        json_schema_extra={"label": "跳过链接与代码块", "order": 7},
+        json_schema_extra={"label": "跳过链接与代码块", "order": 10},
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_enabled(cls, data: Any) -> Any:
+        """兼容旧版 [auto_voice].enabled 布尔开关，平滑迁移至 mode。"""
+        if not isinstance(data, Mapping):
+            return data
+        copied = dict(data)
+        if "mode" not in copied and "enabled" in copied:
+            copied["mode"] = "always" if bool(copied.get("enabled")) else "off"
+        copied.pop("enabled", None)
+        return copied
 
 
 class StorageSectionConfig(PluginConfigBase):
@@ -659,10 +769,12 @@ def split_tts_segments(
     return segments
 
 
-def _collect_at_names(message: dict[str, Any]) -> list[str]:
-    """提取出站消息中 @ 段对应的昵称列表，避免正文朗读冗余 @ 称呼。"""
+def _collect_at_names_from_segments(segments: Any) -> list[str]:
+    """从消息段列表提取 @ 段对应的昵称列表，避免正文朗读冗余 @ 称呼。"""
     names: list[str] = []
-    for item in message.get("raw_message") or []:
+    if not isinstance(segments, list):
+        return names
+    for item in segments:
         if not isinstance(item, dict):
             continue
         if str(item.get("type") or "").strip().lower() != "at":
@@ -677,14 +789,13 @@ def _collect_at_names(message: dict[str, Any]) -> list[str]:
     return names
 
 
-def _extract_outbound_plain_text(message: dict[str, Any]) -> Optional[str]:
-    """提取可转为语音的出站纯文本；遇到语音/图片/文件/视频等非文本段返回 None。"""
-    raw_message = message.get("raw_message")
-    if not isinstance(raw_message, list) or not raw_message:
+def _extract_plain_text_from_segments(segments: Any) -> Optional[str]:
+    """提取可转为语音的纯文本；遇到语音/图片/文件/视频等非文本段返回 None。"""
+    if not isinstance(segments, list) or not segments:
         return None
 
     parts: list[str] = []
-    for item in raw_message:
+    for item in segments:
         if not isinstance(item, dict):
             return None
         seg_type = str(item.get("type") or "").strip().lower()
@@ -712,12 +823,190 @@ def _extract_outbound_plain_text(message: dict[str, Any]) -> Optional[str]:
     if not text:
         return None
 
-    for name in _collect_at_names(message):
+    for name in _collect_at_names_from_segments(segments):
         mention = f"@{name}"
         if mention in text:
             text = text.replace(mention, " ")
     normalized = _MULTI_SPACE_RE.sub(" ", text).strip()
     return normalized or None
+
+
+def _extract_outbound_plain_text(message: dict[str, Any]) -> Optional[str]:
+    """提取出站消息中可转为语音的纯文本；遇到非文本媒体段返回 None。"""
+    return _extract_plain_text_from_segments(message.get("raw_message"))
+
+
+def _has_voice_segment(raw_message: Any) -> bool:
+    """判断消息段列表是否已包含语音或语音链接段。"""
+    if not isinstance(raw_message, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and str(item.get("type") or "").strip().lower() in {"voice", "voiceurl"}
+        for item in raw_message
+    )
+
+
+def _resolve_temperature_tier(temperature: float) -> tuple[str, str]:
+    """按温度值匹配对应的 Planner 语音倾向档位描述与引导文案。"""
+    clamped = max(0.0, min(1.0, float(temperature)))
+    for max_temp, label, guidance in _PLANNER_TEMPERATURE_TIERS:
+        if clamped <= max_temp + 1e-9:
+            return label, guidance
+    _, label, guidance = _PLANNER_TEMPERATURE_TIERS[-1]
+    return label, guidance
+
+
+def _should_allow_planner_voice(
+    temperature: float,
+    *,
+    explicit_request: bool,
+    suitability: float,
+) -> bool:
+    """结合 Planner 温度滑块与语境契合度决定是否放行语音回复。"""
+    clamped_temp = max(0.0, min(1.0, float(temperature)))
+    clamped_score = max(0.0, min(1.0, float(suitability)))
+    if explicit_request:
+        return True
+    if clamped_temp <= 0.0:
+        return False
+    if clamped_temp >= 1.0:
+        return True
+    min_suitability = 1.0 - clamped_temp
+    return clamped_score + 1e-9 >= min_suitability
+
+
+def _find_voice_extension_key(tool_definitions: Any) -> str:
+    """从 reply 工具声明的 plugin_options 中动态定位本插件回复扩展键名。"""
+    if not isinstance(tool_definitions, list):
+        return _DEFAULT_VOICE_EXTENSION_FULL_NAME
+    for tool_def in tool_definitions:
+        if not isinstance(tool_def, dict):
+            continue
+        fn = tool_def.get("function")
+        if not isinstance(fn, dict) or fn.get("name") != "reply":
+            continue
+        params = fn.get("parameters")
+        if not isinstance(params, dict):
+            continue
+        props = params.get("properties")
+        if not isinstance(props, dict):
+            continue
+        plugin_opts = props.get("plugin_options")
+        if not isinstance(plugin_opts, dict):
+            continue
+        ext_props = plugin_opts.get("properties")
+        if not isinstance(ext_props, dict):
+            continue
+        for key in ext_props:
+            key_str = str(key)
+            if key_str == _DEFAULT_VOICE_EXTENSION_FULL_NAME or (
+                key_str.endswith(f".{_VOICE_REPLY_EXTENSION_NAME}") and "fishaudio" in key_str.lower()
+            ):
+                return key_str
+    return _DEFAULT_VOICE_EXTENSION_FULL_NAME
+
+
+def _build_planner_voice_instruction(temperature: float, extension_full_name: str) -> str:
+    """构造注入给 MaiSaka Planner 的动态语音策略指引。"""
+    clamped = max(0.0, min(1.0, float(temperature)))
+    tier_label, tier_guidance = _resolve_temperature_tier(clamped)
+    return (
+        "【Fish Audio 语音回复策略】\n"
+        f"当前语音倾向温度：{clamped:.2f}（{tier_label}）。{tier_guidance}\n"
+        f"需要发送语音时：优先在 reply 工具的 plugin_options[\"{extension_full_name}\"] 中启用"
+        "（被动发言模式则直接在发言指导中说明使用语音并注明风格），也可仅在需要独立短语音时直接调用 send_voice_reply；"
+        "切勿对同一条回复同时输出文字与语音。\n"
+        "参考边界：适合语音（情绪安慰、撒娇关心、道别问候、接梗吐槽、对方刚发来语音或明确要求语音）；"
+        "建议保持文字（超过两三句的长内容、分点列举、原理/步骤解释、含网址链接或代码块、以及上一条刚连续用过语音的普通应答）。"
+    )
+
+
+def _filter_voice_tools_for_non_planner(tool_definitions: Any) -> tuple[list[Any], bool]:
+    """在非 planner 模式下从候选工具声明中移除语音工具及 reply 的语音扩展选项。"""
+    if not isinstance(tool_definitions, list):
+        return [], False
+
+    changed = False
+    filtered: list[Any] = []
+    for raw_tool in tool_definitions:
+        if not isinstance(raw_tool, dict):
+            filtered.append(raw_tool)
+            continue
+        fn = raw_tool.get("function")
+        fn_name = fn.get("name") if isinstance(fn, dict) else None
+        if fn_name == "send_voice_reply":
+            changed = True
+            continue
+
+        if fn_name == "reply" and isinstance(fn, dict):
+            params = fn.get("parameters")
+            props = params.get("properties") if isinstance(params, dict) else None
+            plugin_opts = props.get("plugin_options") if isinstance(props, dict) else None
+            ext_props = plugin_opts.get("properties") if isinstance(plugin_opts, dict) else None
+            if isinstance(ext_props, dict):
+                to_remove = [
+                    str(k)
+                    for k in ext_props
+                    if str(k) == _DEFAULT_VOICE_EXTENSION_FULL_NAME
+                    or (str(k).endswith(f".{_VOICE_REPLY_EXTENSION_NAME}") and "fishaudio" in str(k).lower())
+                ]
+                if to_remove:
+                    tool_copy = copy.deepcopy(raw_tool)
+                    copy_props = tool_copy["function"]["parameters"]["properties"]
+                    copy_ext_props = copy_props["plugin_options"]["properties"]
+                    for k in to_remove:
+                        copy_ext_props.pop(k, None)
+                    if not copy_ext_props:
+                        copy_props.pop("plugin_options", None)
+                    filtered.append(tool_copy)
+                    changed = True
+                    continue
+
+        filtered.append(raw_tool)
+    return filtered, changed
+
+
+def _strip_planner_instruction_items(items: list[Any]) -> tuple[list[Any], bool]:
+    """移除此前注入的 Fish Audio Planner 语音策略提示 Item。"""
+    cleaned: list[Any] = []
+    removed = False
+    for item in items:
+        if isinstance(item, dict):
+            meta = item.get("meta")
+            item_id = str(meta.get("item_id") or "") if isinstance(meta, dict) else ""
+            if item_id.startswith(_PLANNER_VOICE_ITEM_PREFIX):
+                removed = True
+                continue
+        cleaned.append(item)
+    return cleaned, removed
+
+
+def _upsert_planner_instruction_item(
+    items: list[Any],
+    session_id: str,
+    instruction: str,
+) -> tuple[list[Any], bool]:
+    """向 Planner Context Items 的最后一条用户消息前插入或更新语音策略提示。"""
+    cleaned, _ = _strip_planner_instruction_items(items)
+    target_id = f"{_PLANNER_VOICE_ITEM_PREFIX}{session_id or 'default'}"
+    new_item = {
+        "item_type": "SystemMessageItem",
+        "meta": {
+            "item_id": target_id,
+            "logical_turn_id": None,
+            "timestamp": datetime.now().isoformat(),
+        },
+        "parts": [{"type": "text", "text": instruction}],
+    }
+    insert_at = len(cleaned)
+    for index in range(len(cleaned) - 1, -1, -1):
+        entry = cleaned[index]
+        if isinstance(entry, dict) and entry.get("item_type") == "UserMessageItem":
+            insert_at = index
+            break
+    updated = [*cleaned[:insert_at], new_item, *cleaned[insert_at:]]
+    return updated, updated != items
 
 
 def _build_voice_hook_result(
@@ -877,6 +1166,24 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         self._semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
         self._max_concurrency: int = 1
         self._fallback_bypass: dict[tuple[str, str], float] = {}
+        self._random_decisions: dict[str, tuple[bool, float]] = {}
+
+    def normalize_plugin_config(self, config_data: Mapping[str, Any] | None) -> tuple[dict[str, Any], bool]:
+        """在 SDK 默认值补齐前迁移旧版 [auto_voice].enabled 至 mode。"""
+        if not isinstance(config_data, Mapping):
+            return super().normalize_plugin_config(config_data)
+
+        prepared = copy.deepcopy(dict(config_data))
+        raw_auto = prepared.get("auto_voice")
+        migrated = False
+        if isinstance(raw_auto, Mapping) and "mode" not in raw_auto and "enabled" in raw_auto:
+            auto_copy = dict(raw_auto)
+            auto_copy["mode"] = "always" if bool(auto_copy.pop("enabled")) else "off"
+            prepared["auto_voice"] = auto_copy
+            migrated = True
+
+        normalized, changed = super().normalize_plugin_config(prepared)
+        return normalized, changed or migrated
 
     def _safe_ctx(self) -> Any:
         try:
@@ -898,6 +1205,17 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             return True
         plugin_sec = getattr(cfg, "plugin", None)
         return bool(getattr(plugin_sec, "enabled", True))
+
+    def _auto_voice_mode(self) -> str:
+        av = getattr(self.config, "auto_voice", None)
+        if av is None:
+            return "off"
+        mode = str(getattr(av, "mode", "") or "").strip().lower()
+        if mode in _AUTO_VOICE_MODES:
+            return mode
+        if hasattr(av, "enabled"):
+            return "always" if bool(getattr(av, "enabled")) else "off"
+        return "planner"
 
     def _voices_dir(self) -> Path:
         raw_dir = str(getattr(getattr(self.config, "voice", None), "voices_dir", "") or "voices")
@@ -921,6 +1239,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         """按当前配置重建服务客户端与音频处理器，返回旧客户端供异步关闭。"""
         cfg: FishAudioPluginConfig = self.config
         old_service = self._tts_service
+        self._random_decisions.clear()
 
         self._max_concurrency = max(1, int(cfg.request.max_concurrency or 1))
         self._semaphore = asyncio.Semaphore(self._max_concurrency)
@@ -967,9 +1286,11 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         cfg = self.config
         has_key = bool(str(cfg.voice.fish_api_key or "").strip())
         self._log.info(
-            "Fish Audio TTS 插件已加载 (enabled=%s, auto_voice=%s, model=%s, voice_mode=%s, has_key=%s, local_voices=%d)",
+            "Fish Audio TTS 插件已加载 (enabled=%s, auto_mode=%s, planner_temp=%.2f, random_prob=%.2f, model=%s, voice_mode=%s, has_key=%s, local_voices=%d)",
             self._is_enabled(),
-            bool(cfg.auto_voice.enabled),
+            self._auto_voice_mode(),
+            float(cfg.auto_voice.planner_temperature),
+            float(cfg.auto_voice.random_probability),
             cfg.voice.model,
             cfg.voice.voice_mode,
             has_key,
@@ -988,7 +1309,11 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         self,
         scope: str = CONFIG_RELOAD_SCOPE_SELF,
         config_data: Any = None,
+        version: str = "",
+        *_args: Any,
+        **_kwargs: Any,
     ) -> None:
+        del config_data
         if scope != CONFIG_RELOAD_SCOPE_SELF:
             return
         old_service = self._rebuild_runtime()
@@ -996,9 +1321,12 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             await old_service.close()
         await self._run_storage_prune()
         self._log.info(
-            "Fish Audio TTS 配置已热重载 (enabled=%s, auto_voice=%s, model=%s, voice_mode=%s)",
+            "Fish Audio TTS 配置已热重载 (version=%s, enabled=%s, auto_mode=%s, planner_temp=%.2f, random_prob=%.2f, model=%s, voice_mode=%s)",
+            str(version or self.config.plugin.config_version),
             self._is_enabled(),
-            bool(self.config.auto_voice.enabled),
+            self._auto_voice_mode(),
+            float(self.config.auto_voice.planner_temperature),
+            float(self.config.auto_voice.random_probability),
             self.config.voice.model,
             self.config.voice.voice_mode,
         )
@@ -1362,6 +1690,86 @@ class FishAudioVoicePlugin(MaiBotPlugin):
 
         return ""
 
+    def _format_fallback_text(self, raw_text: str) -> str:
+        """按降级配置清洗台词副语言标签并填充保底文本。"""
+        fb = self.config.fallback
+        cleaned = strip_audio_tags(raw_text) if fb.strip_audio_tags else (raw_text or "").strip()
+        if cleaned:
+            return cleaned
+        return str(fb.empty_text_placeholder or "").strip() or "（想说点什么，但声音没发出来）"
+
+    def _strip_tags_in_reply_messages(self, messages: list[dict[str, Any]]) -> Optional[list[dict[str, Any]]]:
+        """当语音扩展降级保留文字时，按配置剥离仅用于 TTS 的情感舞台标签；无变化返回 None。"""
+        if not self.config.fallback.strip_audio_tags:
+            return None
+        changed = False
+        cleaned_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                cleaned_messages.append(msg)
+                continue
+            segments = msg.get("segments")
+            if not isinstance(segments, list):
+                cleaned_messages.append(msg)
+                continue
+            new_segments: list[dict[str, Any]] = []
+            for seg in segments:
+                if isinstance(seg, dict) and str(seg.get("type") or "").strip().lower() == "text":
+                    orig = str(seg.get("data") or "")
+                    stripped = self._format_fallback_text(orig)
+                    if stripped != orig:
+                        changed = True
+                    new_segments.append({"type": "text", "data": stripped})
+                else:
+                    new_segments.append(seg)
+            cleaned_messages.append({"segments": new_segments, "quote_previous": bool(msg.get("quote_previous", False))})
+        return cleaned_messages if changed else None
+
+    def _explain_ineligible_auto_voice_text(self, spoken_text: str) -> Optional[str]:
+        """校验文本长度与内容是否符合自动/扩展转语音条件；不符合时返回原因说明。"""
+        av = getattr(self.config, "auto_voice", None)
+        if av is None or not spoken_text:
+            return "空文本或缺少 auto_voice 配置"
+        if len(spoken_text) < int(av.min_text_length):
+            return f"长度 {len(spoken_text)} 小于 min_text_length={int(av.min_text_length)}"
+        if len(spoken_text) > int(av.max_text_length):
+            return f"长度 {len(spoken_text)} 超过 max_text_length={int(av.max_text_length)}"
+        if av.skip_urls_and_code:
+            for pat in _UNSUITABLE_TEXT_PATTERNS:
+                if pat in spoken_text:
+                    return f"包含跳过模式 {pat!r}"
+        return None
+
+    def _is_eligible_auto_voice_text(self, spoken_text: str) -> bool:
+        """校验文本长度与内容是否符合自动/扩展转语音条件。"""
+        return self._explain_ineligible_auto_voice_text(spoken_text) is None
+
+    def _should_convert_by_probability(
+        self,
+        stream_id: str,
+        probability: float,
+        ttl_seconds: float,
+    ) -> tuple[bool, bool]:
+        """按随机概率与短时 TTL 缓存决定出站纯文本是否转为语音，返回 (是否转换, 是否命中缓存)。"""
+        prob = max(0.0, min(1.0, float(probability)))
+        now = time.monotonic()
+        self._random_decisions = {sid: item for sid, item in self._random_decisions.items() if item[1] > now}
+
+        if ttl_seconds > 0 and stream_id in self._random_decisions:
+            decision, _ = self._random_decisions[stream_id]
+            return decision, True
+
+        if prob <= 0.0:
+            decision = False
+        elif prob >= 1.0:
+            decision = True
+        else:
+            decision = random.random() < prob
+
+        if ttl_seconds > 0:
+            self._random_decisions[stream_id] = (decision, now + float(ttl_seconds))
+        return decision, False
+
     async def _fallback_to_text(
         self,
         raw_text: str,
@@ -1386,9 +1794,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
                 "error": f"{reason}；且未能确定目标聊天流 stream_id",
             }
 
-        text_to_send = strip_audio_tags(raw_text) if fb.strip_audio_tags else (raw_text or "").strip()
-        if not text_to_send:
-            text_to_send = str(fb.empty_text_placeholder or "（想说点什么，但声音没发出来）").strip()
+        text_to_send = self._format_fallback_text(raw_text)
 
         self._register_fallback_bypass(stream_id, text_to_send)
         try:
@@ -1491,25 +1897,277 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         return sent_count, ""
 
     @HookHandler(
+        "maisaka.planner.before_request",
+        name="fish_planner_voice_policy",
+        description="按当前语音触发模式与 Planner 温度滑块动态调整语音扩展可见性与倾向指引",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.NORMAL,
+        timeout_ms=2500,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def planner_before_request_hook(self, **kwargs: Any) -> Optional[dict[str, Any]]:
+        """在 Planner 请求前注入语音决策策略，或在非 planner 模式下隐藏语音扩展。"""
+        items = kwargs.get("items")
+        tool_definitions = kwargs.get("tool_definitions")
+        if not isinstance(items, list):
+            return None
+
+        active_planner = self._is_enabled() and self._auto_voice_mode() == "planner"
+        updated_kwargs = dict(kwargs)
+        mutated = False
+
+        if not active_planner:
+            cleaned_items, items_changed = _strip_planner_instruction_items(items)
+            if items_changed:
+                updated_kwargs["items"] = cleaned_items
+                mutated = True
+            if isinstance(tool_definitions, list):
+                filtered_tools, tools_changed = _filter_voice_tools_for_non_planner(tool_definitions)
+                if tools_changed:
+                    updated_kwargs["tool_definitions"] = filtered_tools
+                    mutated = True
+            return {"action": "continue", "modified_kwargs": updated_kwargs} if mutated else None
+
+        session_id = str(kwargs.get("session_id") or "").strip()
+        av = self.config.auto_voice
+        ext_full_name = _find_voice_extension_key(tool_definitions)
+        instruction = _build_planner_voice_instruction(float(av.planner_temperature), ext_full_name)
+        updated_items, items_changed = _upsert_planner_instruction_item(items, session_id, instruction)
+        if items_changed:
+            updated_kwargs["items"] = updated_items
+            mutated = True
+        return {"action": "continue", "modified_kwargs": updated_kwargs} if mutated else None
+
+    @ReplyExtension(
+        _VOICE_REPLY_EXTENSION_NAME,
+        description=(
+            "将本次回复通过 Fish Audio 合成为语音消息发送（仅适合口语互动或明确要求语音时启用，长文/代码/链接请保持文字）。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "use_voice": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "是否将该条回复转为语音发送；选定本扩展时通常为 true。",
+                },
+                "explicit_request": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "是否为用户明确要求发语音（如“发条语音/念给我听”）或对方刚发来语音需要语音回应。",
+                },
+                "suitability": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "default": 0.7,
+                    "description": "自评当前语境使用语音的契合度（0.0-1.0）；情绪互动/撒娇安慰填 0.8-1.0，普通闲聊填 0.4-0.7。",
+                },
+                "style": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选风格/语气提示（如 gentle、whispering、excited；留空不附加额外标签）。",
+                },
+                "voice": {
+                    "type": "string",
+                    "default": "",
+                    "description": "可选音色覆盖（本地 voices/ 文件名或云端 reference_id）；留空使用默认音色。",
+                },
+            },
+            "additionalProperties": False,
+        },
+        generation_prompt=(
+            "若本次准备转为语音发送，请保持自然口语与适中篇幅，避免 Markdown 列表、链接或代码块；"
+            "可按语境自然使用简短副语言提示（如 [laughing]、[sighs]、[whispering]）。"
+        ),
+        timeout_ms=90000,
+    )
+    async def voice_reply_extension(
+        self,
+        phase: str = "",
+        parameters: Optional[dict[str, Any]] = None,
+        text: str = "",
+        messages: Optional[list[dict[str, Any]]] = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """MaiSaka 原生回复扩展：在 Planner 选择语音时将回复文本分段合成并替换为 voice 段。"""
+        del text, kwargs
+        if phase == "prepare":
+            # 保持返回空字典以同时兼容 reply 工具串行模式与 passive_replyer 并行补充模式
+            return {}
+        if phase != "before_send" or not isinstance(messages, list) or not messages:
+            return {}
+
+        if not self._is_enabled() or self._auto_voice_mode() != "planner":
+            self._log.info(
+                "Planner 语音扩展未生效 (enabled=%s, mode=%s)，保留文字发送",
+                self._is_enabled(),
+                self._auto_voice_mode(),
+            )
+            cleaned = self._strip_tags_in_reply_messages(messages)
+            return {"messages": cleaned} if cleaned is not None else {}
+
+        params = parameters if isinstance(parameters, dict) else {}
+        if not bool(params.get("use_voice", True)):
+            self._log.info("Planner 语音扩展参数 use_voice=False，保留文字发送")
+            cleaned = self._strip_tags_in_reply_messages(messages)
+            return {"messages": cleaned} if cleaned is not None else {}
+
+        explicit_request = bool(params.get("explicit_request", False))
+        try:
+            suitability = float(params.get("suitability", 0.7))
+        except (TypeError, ValueError):
+            suitability = 0.7
+
+        av = self.config.auto_voice
+        if not _should_allow_planner_voice(
+            float(av.planner_temperature),
+            explicit_request=explicit_request,
+            suitability=suitability,
+        ):
+            self._log.info(
+                "Planner 语音扩展被温度阈值过滤 (temp=%.2f, suitability=%.2f, explicit=%s)，保留文字发送",
+                float(av.planner_temperature),
+                suitability,
+                explicit_request,
+            )
+            cleaned = self._strip_tags_in_reply_messages(messages)
+            return {"messages": cleaned} if cleaned is not None else {}
+
+        plan_entries: list[tuple[bool, dict[str, Any], list[str]]] = []
+        convertible_texts: list[str] = []
+        for orig_msg in messages:
+            if not isinstance(orig_msg, dict):
+                continue
+            raw_segments = orig_msg.get("segments")
+            spoken_text = _extract_plain_text_from_segments(raw_segments)
+            if not spoken_text:
+                plan_entries.append((False, orig_msg, []))
+                continue
+            convertible_texts.append(spoken_text)
+            sub_segments = split_tts_segments(
+                spoken_text,
+                max_chars=int(av.max_segment_chars),
+                split_sentences=bool(av.split_sentences),
+            )
+            plan_entries.append((bool(sub_segments), orig_msg, sub_segments))
+
+        combined_spoken = "\n".join(convertible_texts).strip()
+        if not convertible_texts:
+            self._log.info("Planner 语音扩展未检测到可朗读纯文本分段，保留原消息发送")
+            cleaned = self._strip_tags_in_reply_messages(messages)
+            return {"messages": cleaned} if cleaned is not None else {}
+        ineligible_reason = self._explain_ineligible_auto_voice_text(combined_spoken)
+        if ineligible_reason is not None:
+            self._log.info("Planner 语音扩展跳过转语音 (%s)，保留文字发送", ineligible_reason)
+            cleaned = self._strip_tags_in_reply_messages(messages)
+            return {"messages": cleaned} if cleaned is not None else {}
+
+        flat_segments = [seg for is_conv, _, segs in plan_entries if is_conv for seg in segs]
+        if not flat_segments:
+            return {}
+
+        style_arg = str(params.get("style") or "").strip()
+        voice_arg = str(params.get("voice") or "").strip()
+        synthesized: list[dict[str, Any]] = []
+        try:
+            synthesized, failed_from, synth_err = await self._synthesize_segments(
+                flat_segments,
+                voice=voice_arg,
+                style=style_arg,
+                total_budget_sec=75.0,
+            )
+            if failed_from is not None and not synthesized:
+                self._log.warning("Planner 语音扩展首段合成未完成 (%s)，保留文字发送", synth_err)
+                if not self.config.fallback.fallback_to_text:
+                    raise RuntimeError(synth_err or "Fish Audio 语音合成失败")
+                cleaned = self._strip_tags_in_reply_messages(messages)
+                return {"messages": cleaned} if cleaned is not None else {}
+
+            out_messages: list[dict[str, Any]] = []
+            flat_idx = 0
+            fallback_to_text = bool(self.config.fallback.fallback_to_text)
+            for is_conv, orig_msg, sub_segments in plan_entries:
+                if not is_conv:
+                    out_messages.append(orig_msg)
+                    continue
+                emitted_fallback = False
+                for sub_seg in sub_segments:
+                    if flat_idx < len(synthesized):
+                        item = synthesized[flat_idx]
+                        out_messages.append(
+                            {
+                                "segments": [
+                                    {
+                                        "type": "voice",
+                                        "data": str(item["text"]),
+                                        "binary_data_base64": str(item["audio_base64"]),
+                                    }
+                                ],
+                                "quote_previous": False,
+                            }
+                        )
+                    elif fallback_to_text:
+                        quote_prev = bool(orig_msg.get("quote_previous", False)) and not emitted_fallback
+                        emitted_fallback = True
+                        out_messages.append(
+                            {
+                                "segments": [{"type": "text", "data": self._format_fallback_text(sub_seg)}],
+                                "quote_previous": quote_prev,
+                            }
+                        )
+                    flat_idx += 1
+
+            if not out_messages:
+                raise RuntimeError(synth_err or "Fish Audio 语音合成失败")
+
+            last_item = synthesized[-1]
+            self._log.info(
+                "Planner 语音扩展改写完成 (segments=%d/%d, model=%s, voice=%s, temp=%.2f, suitability=%.2f, explicit=%s)",
+                len(synthesized),
+                len(flat_segments),
+                last_item["model"],
+                last_item["voice"],
+                float(av.planner_temperature),
+                suitability,
+                explicit_request,
+            )
+            return {"messages": out_messages}
+        finally:
+            await self._cleanup_deferred_files(synthesized)
+
+    @HookHandler(
         "send_service.before_send",
         name="fish_auto_voice",
-        description="按配置默认将所有符合条件的出站文字回复转为 Fish Audio 语音并分段发送",
+        description="按触发模式（always 全量 / probability 随机概率）将出站纯文本转为 Fish Audio 语音，并保护语音消息不被引用标记阻断",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         timeout_ms=90000,
         error_policy=ErrorPolicy.SKIP,
     )
     async def auto_voice_hook(self, **kwargs: Any) -> Optional[dict[str, Any]]:
-        """出站前拦截：开启默认语音回复后，将纯文本转为语音并支持自动分段。"""
+        """出站前拦截：支持 always / probability 模式转语音，并对已转语音消息清除不兼容的引用标记。"""
         if not self._is_enabled():
-            return None
-
-        av = getattr(self.config, "auto_voice", None)
-        if av is None or not av.enabled:
             return None
 
         message = kwargs.get("message")
         if not isinstance(message, dict):
+            return None
+
+        if _has_voice_segment(message.get("raw_message")):
+            if kwargs.get("set_reply"):
+                updated_kwargs = dict(kwargs)
+                updated_kwargs["set_reply"] = False
+                updated_kwargs["reply_message_id"] = ""
+                return {"action": "continue", "modified_kwargs": updated_kwargs}
+            return None
+
+        mode = self._auto_voice_mode()
+        if mode not in {"always", "probability"}:
+            return None
+
+        av = getattr(self.config, "auto_voice", None)
+        if av is None:
             return None
 
         stream_id = str(kwargs.get("stream_id") or message.get("session_id") or "").strip()
@@ -1523,11 +2181,23 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         if self._consume_fallback_bypass(stream_id, spoken_text):
             return None
 
-        if len(spoken_text) < int(av.min_text_length) or len(spoken_text) > int(av.max_text_length):
+        if not self._is_eligible_auto_voice_text(spoken_text):
             return None
 
-        if av.skip_urls_and_code and any(pat in spoken_text for pat in ("http://", "https://", "```", "![", "|--")):
-            return None
+        if mode == "probability":
+            should_convert, from_cache = self._should_convert_by_probability(
+                stream_id,
+                float(av.random_probability),
+                float(getattr(av, "decision_ttl_seconds", 8.0) or 0.0),
+            )
+            if not should_convert:
+                self._log.debug(
+                    "纯随机语音跳过 (stream=%s, prob=%.2f, cached=%s)",
+                    stream_id,
+                    float(av.random_probability),
+                    from_cache,
+                )
+                return None
 
         segments = split_tts_segments(
             spoken_text,
@@ -1547,7 +2217,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             )
             if failed_from is not None:
                 if not synthesized:
-                    self._log.warning("默认出站语音首段未完成 (%s)，改由原文字发出", synth_err)
+                    self._log.warning("出站自动语音首段未完成 (%s)，改由原文字发出", synth_err)
                     return None
                 sent_count, send_err = await self._send_segment_sequence(
                     synthesized,
@@ -1592,7 +2262,8 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             await self._cleanup_deferred_files([last_item])
 
             self._log.info(
-                "默认出站语音改写完成 (stream=%s, segments=%d, model=%s, voice=%s)",
+                "出站语音改写完成 (mode=%s, stream=%s, segments=%d, model=%s, voice=%s)",
+                mode,
                 stream_id,
                 len(synthesized),
                 last_item["model"],
@@ -1605,7 +2276,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
                 str(last_item["text"]),
             )
         except Exception as exc:  # noqa: BLE001
-            self._log.warning("默认出站语音链路异常中断: %s", exc)
+            self._log.warning("出站语音链路异常中断: %s", exc)
             await self._cleanup_deferred_files(synthesized[sent_head:])
             if sent_head > 0:
                 return _build_text_override_hook_result(
@@ -1618,10 +2289,12 @@ class FishAudioVoicePlugin(MaiBotPlugin):
     @Tool(
         "send_voice_reply",
         description=(
-            "使用 Fish Audio TTS 将回复内容合成为语音并发送给当前用户/群聊。"
-            "可在文本中自然使用 Fish Audio S2 情感标签（如 [laughing]、[sighs]、[whispering]）增强表达；"
-            "若已启用默认全局语音回复，普通文本回复也会自动转为语音发送。"
+            "使用 Fish Audio TTS 将指定台词合成为语音并直接发送到当前会话。"
+            "优先建议通过 reply 工具的 plugin_options 启用语音扩展以保留完整人设回复；"
+            "当需要独立直接发送一段短语音（如撒娇、慰问、晚安或对方明确要听语音）时可调用本工具，"
+            "调用成功后不要再用 reply 发送重复文字。可在文本中自然插入 [laughing]、[sighs]、[whispering] 等标签。"
         ),
+        visibility="visible",
         parameters=[
             ToolParameterInfo(
                 name="text",
@@ -1732,6 +2405,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         return {
             "success": True,
             "status": "sent",
+            "content": "语音已合成并发送给对方，无需再用 reply 发送重复文字。",
             "stream_id": stream_id,
             "segments": len(synthesized),
             "model": last_item["model"],

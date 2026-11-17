@@ -111,20 +111,71 @@ class ConfigAndEndpointTests(unittest.TestCase):
     def test_default_config_matches_spec(self) -> None:
         cfg = FishAudioPluginConfig()
         self.assertTrue(cfg.plugin.enabled)
+        self.assertEqual(cfg.plugin.config_version, "1.1.0")
         self.assertEqual(cfg.voice.model, "s2.1-pro-free")
         self.assertEqual(cfg.voice.api_base_url, "https://api.fish.audio/v1/tts")
         self.assertEqual(cfg.voice.voice_mode, "auto")
         self.assertEqual(cfg.voice.reference_id, "")
         self.assertEqual(cfg.voice.audio_format, "mp3")
+        self.assertEqual(cfg.auto_voice.mode, "planner")
+        self.assertAlmostEqual(cfg.auto_voice.planner_temperature, 0.5)
+        self.assertAlmostEqual(cfg.auto_voice.random_probability, 0.5)
+        self.assertAlmostEqual(cfg.auto_voice.decision_ttl_seconds, 8.0)
         self.assertEqual(cfg.generation.chunk_length, 300)
         self.assertEqual(cfg.generation.prosody_speed, 1.0)
         self.assertTrue(cfg.fallback.fallback_to_text)
 
-    def test_example_toml_parses_against_schema(self) -> None:
+    def test_example_and_active_toml_parse_against_schema(self) -> None:
         data = tomllib.loads((PLUGIN_DIR / "config.example.toml").read_text(encoding="utf-8"))
         cfg = FishAudioPluginConfig.model_validate(data)
         self.assertEqual(cfg.voice.fish_api_key, "")
         self.assertEqual(cfg.voice.model, "s2.1-pro-free")
+        self.assertEqual(cfg.auto_voice.mode, "planner")
+        self.assertAlmostEqual(cfg.auto_voice.planner_temperature, 0.5)
+        self.assertAlmostEqual(cfg.auto_voice.random_probability, 0.5)
+
+        active_path = PLUGIN_DIR / "config.toml"
+        if active_path.is_file():
+            active_data = tomllib.loads(active_path.read_text(encoding="utf-8"))
+            active_cfg = FishAudioPluginConfig.model_validate(active_data)
+            self.assertEqual(active_cfg.auto_voice.mode, "planner")
+
+    def test_webui_schema_sliders_and_legacy_config_migration(self) -> None:
+        plugin = create_plugin()
+        schema = plugin.get_webui_config_schema(plugin_id="custom.maibot-fishaudio-voice-pro")
+        av_fields = schema["sections"]["auto_voice"]["fields"]
+
+        self.assertEqual(av_fields["mode"]["type"], "select")
+        self.assertEqual(av_fields["mode"]["choices"], ["planner", "probability", "always", "off"])
+        self.assertIn("choice:planner", av_fields["mode"]["i18n"]["zh-CN"])
+
+        for slider_name in ("planner_temperature", "random_probability"):
+            field_schema = av_fields[slider_name]
+            self.assertEqual(field_schema["ui_type"], "slider")
+            self.assertEqual(field_schema["min"], 0.0)
+            self.assertEqual(field_schema["max"], 1.0)
+            self.assertEqual(field_schema["step"], 0.05)
+
+        # 旧版 1.0.0 enabled=true/false 迁移
+        migrated_on, changed_on = plugin.normalize_plugin_config(
+            {"plugin": {"config_version": "1.0.0", "enabled": True}, "auto_voice": {"enabled": True}}
+        )
+        self.assertTrue(changed_on)
+        self.assertEqual(migrated_on["auto_voice"]["mode"], "always")
+        self.assertNotIn("enabled", migrated_on["auto_voice"])
+
+        migrated_off, changed_off = plugin.normalize_plugin_config(
+            {"plugin": {"config_version": "1.0.0", "enabled": True}, "auto_voice": {"enabled": False}}
+        )
+        self.assertTrue(changed_off)
+        self.assertEqual(migrated_off["auto_voice"]["mode"], "off")
+
+        # 显式校验组件收集（ReplyExtension 与可见 Tool）
+        components = {c["name"]: c for c in plugin.get_components()}
+        self.assertIn("voice_reply", components)
+        self.assertEqual(components["voice_reply"]["type"], "REPLY_EXTENSION")
+        self.assertEqual(components["fish_planner_voice_policy"]["type"], "HOOK_HANDLER")
+        self.assertEqual(components["send_voice_reply"]["metadata"].get("visibility"), "visible")
 
     def test_resolve_tts_endpoint(self) -> None:
         self.assertEqual(resolve_tts_endpoint(""), "https://api.fish.audio/v1/tts")
@@ -132,6 +183,20 @@ class ConfigAndEndpointTests(unittest.TestCase):
         self.assertEqual(resolve_tts_endpoint("https://api.fish.audio/v1"), "https://api.fish.audio/v1/tts")
         self.assertEqual(resolve_tts_endpoint("https://api.fish.audio/v1/tts/"), "https://api.fish.audio/v1/tts")
         self.assertEqual(resolve_tts_endpoint("https://proxy.example.com/custom"), "https://proxy.example.com/custom/v1/tts")
+
+    def test_pydantic_legacy_config_migration(self) -> None:
+        """测试 AutoVoiceSectionConfig 在 Pydantic 校验阶段对旧版 enabled 开关的平滑迁移。"""
+        cfg_enabled = plugin_mod.AutoVoiceSectionConfig.model_validate({"enabled": True})
+        self.assertEqual(cfg_enabled.mode, "always")
+
+        cfg_disabled = plugin_mod.AutoVoiceSectionConfig.model_validate({"enabled": False})
+        self.assertEqual(cfg_disabled.mode, "off")
+
+        top_enabled = FishAudioPluginConfig.model_validate({"auto_voice": {"enabled": True}})
+        self.assertEqual(top_enabled.auto_voice.mode, "always")
+
+        top_disabled = FishAudioPluginConfig.model_validate({"auto_voice": {"enabled": False}})
+        self.assertEqual(top_disabled.auto_voice.mode, "off")
 
 
 class ServiceProtocolTests(unittest.IsolatedAsyncioTestCase):
@@ -237,6 +302,54 @@ class ServiceProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(res_to["success"])
         self.assertEqual(fake_session.post.call_count, 1)
         await svc.close()
+
+    async def test_retry_resets_session_on_connect_timeout_and_client_error(self) -> None:
+        svc = FishAudioTTSService("sk-test-1234", max_retries=2, retry_backoff=0.01)
+
+        s1 = MagicMock()
+        s1.closed = False
+        s1.close = AsyncMock()
+        conn_key = aiohttp.client_reqrep.ConnectionKey("api.fish.audio", 443, True, True, None, None, None)
+        opaque_err = aiohttp.ClientConnectorError(conn_key, OSError(10060, None))
+        s1.post = MagicMock(side_effect=opaque_err)
+
+        s2 = MagicMock()
+        s2.closed = False
+        s2.close = AsyncMock()
+        s2.post = MagicMock(side_effect=aiohttp.ConnectionTimeoutError("connect stalled"))
+
+        s3 = MagicMock()
+        s3.closed = False
+        s3.close = AsyncMock()
+        s3.post = MagicMock(return_value=_FakeResponse(status=200, body=b"RECOVERED_MP3"))
+
+        sessions = [s1, s2, s3]
+        idx = 0
+
+        async def fake_get_session():
+            nonlocal idx
+            if svc._session is None or svc._session.closed:  # noqa: SLF001
+                svc._session = sessions[idx]  # noqa: SLF001
+                idx += 1
+            return svc._session  # noqa: SLF001
+
+        with patch.object(svc, "_get_session", side_effect=fake_get_session):
+            res = await svc.synthesize("网络恢复测试")
+
+        self.assertTrue(res["success"])
+        self.assertEqual(idx, 3)
+        s1.close.assert_awaited_once()
+        s2.close.assert_awaited_once()
+        self.assertEqual(base64.b64decode(res["audio_base64"]), b"RECOVERED_MP3")
+        formatted = svc._format_client_error(opaque_err)  # noqa: SLF001
+        self.assertIn("errno=10060", formatted)
+        await svc.close()
+
+        # 验证真实 _get_session 启用 trust_env=True
+        real_svc = FishAudioTTSService("sk-test-1234")
+        real_sess = await real_svc._get_session()  # noqa: SLF001
+        self.assertTrue(real_sess.trust_env)
+        await real_svc.close()
 
 
 class AudioAndTagHelpersTests(unittest.IsolatedAsyncioTestCase):
@@ -507,7 +620,7 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_auto_voice_hook_single_and_multi_segment(self) -> None:
-        plugin = self._build_plugin(auto_voice={"enabled": True, "segment_delay_ms": 0, "max_segment_chars": 80})
+        plugin = self._build_plugin(auto_voice={"mode": "always", "segment_delay_ms": 0, "max_segment_chars": 80})
 
         async def fake_synth(text: str, **kwargs: Any) -> dict[str, Any]:
             raw = f"AUDIO:{text}".encode("utf-8")
@@ -555,7 +668,7 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_auto_voice_hook_skip_url_partial_failure_and_fallback_bypass(self) -> None:
-        plugin = self._build_plugin(auto_voice={"enabled": True, "segment_delay_ms": 0})
+        plugin = self._build_plugin(auto_voice={"mode": "always", "segment_delay_ms": 0})
         plugin._tts_service.synthesize = AsyncMock(  # noqa: SLF001
             side_effect=[
                 {
@@ -651,7 +764,7 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
         )
 
         # 三段消息：第3段合成失败，且前2段发送时第2段发送中断 -> 必须保留第2段与第3段文本
-        plugin = self._build_plugin(auto_voice={"enabled": True, "segment_delay_ms": 0})
+        plugin = self._build_plugin(auto_voice={"mode": "always", "segment_delay_ms": 0})
         plugin._tts_service.synthesize = AsyncMock(  # noqa: SLF001
             side_effect=[
                 {"success": True, "audio_base64": base64.b64encode(b"S1").decode("ascii"), "audio_bytes_len": 2, "text": "第一句。"},
@@ -672,7 +785,7 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out_raw, [{"type": "text", "data": "第二句。\n第三句。"}])
 
         # send_voice_reply 同场景也不能丢中间段（文本长度需超过 max_segment_chars 才拆段）
-        plugin_tool = self._build_plugin(auto_voice={"enabled": True, "max_segment_chars": 20, "segment_delay_ms": 0})
+        plugin_tool = self._build_plugin(auto_voice={"mode": "always", "max_segment_chars": 20, "segment_delay_ms": 0})
         plugin_tool._tts_service.synthesize = AsyncMock(  # noqa: SLF001
             side_effect=[
                 {"success": True, "audio_base64": base64.b64encode(b"S1").decode("ascii"), "audio_bytes_len": 2, "text": "第一句较长凑够字数。"},
@@ -700,7 +813,7 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir = Path(tmp)
             plugin = self._build_plugin(
-                auto_voice={"enabled": True, "segment_delay_ms": 10},
+                auto_voice={"mode": "always", "segment_delay_ms": 10},
                 storage={
                     "save_output_audio": True,
                     "output_dir": str(out_dir),
@@ -745,6 +858,488 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(synthesized, [])
             self.assertEqual(failed_idx, 0)
             self.assertIn("预算", err_msg)
+
+
+class PlannerAndProbabilityModeTests(unittest.IsolatedAsyncioTestCase):
+    """Planner 自主决策、温度滑块门控与纯随机概率模式测试。"""
+
+    def _build_plugin(self, **overrides: Any) -> FishAudioVoicePlugin:
+        plugin = create_plugin()
+        cfg = FishAudioPluginConfig()
+        cfg.voice.fish_api_key = "sk-test-token"
+        for section_name, fields in overrides.items():
+            section = getattr(cfg, section_name)
+            for k, v in fields.items():
+                setattr(section, k, v)
+        plugin._plugin_config_instance = cfg
+        plugin._set_context(_make_dummy_ctx(streams=[]))
+        plugin._rebuild_runtime()  # noqa: SLF001
+        return plugin
+
+    @staticmethod
+    def _sample_planner_tools() -> list[dict[str, Any]]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "reply",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "chat_anlyze": {"type": "string"},
+                            "plugin_options": {
+                                "type": "object",
+                                "properties": {
+                                    "custom.maibot-fishaudio-voice-pro.voice_reply": {"type": "object"},
+                                    "other.plugin.extra": {"type": "object"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {"name": "send_voice_reply", "parameters": {"type": "object", "properties": {}}},
+            },
+        ]
+
+    async def test_planner_before_request_injection_and_non_planner_filtering(self) -> None:
+        plugin = self._build_plugin(auto_voice={"mode": "planner", "planner_temperature": 0.25})
+        items = [
+            {"item_type": "SystemMessageItem", "meta": {"item_id": "sys_0"}, "parts": [{"type": "text", "text": "sys"}]},
+            {"item_type": "UserMessageItem", "meta": {"item_id": "u_1"}, "parts": [{"type": "text", "text": "hello"}]},
+        ]
+        tools = self._sample_planner_tools()
+
+        res = await plugin.planner_before_request_hook(
+            items=items,
+            tool_definitions=tools,
+            session_id="qq_1001",
+        )
+        assert res is not None
+        self.assertEqual(res["action"], "continue")
+        new_items = res["modified_kwargs"]["items"]
+        self.assertEqual(len(new_items), 3)
+        self.assertEqual(new_items[1]["meta"]["item_id"], "fishaudio-voice-planner-qq_1001")
+        self.assertIn("0.25", new_items[1]["parts"][0]["text"])
+        self.assertIn("低频克制", new_items[1]["parts"][0]["text"])
+
+        # 切换到 off / probability / always 后应移除注入消息、隐藏 send_voice_reply 及 reply 中的语音扩展
+        plugin.config.auto_voice.mode = "probability"
+        res_off = await plugin.planner_before_request_hook(
+            items=new_items,
+            tool_definitions=tools,
+            session_id="qq_1001",
+        )
+        assert res_off is not None
+        cleaned_items = res_off["modified_kwargs"]["items"]
+        self.assertEqual(len(cleaned_items), 2)
+        filtered_tools = res_off["modified_kwargs"]["tool_definitions"]
+        self.assertEqual([t["function"]["name"] for t in filtered_tools], ["reply"])
+        reply_plugin_props = filtered_tools[0]["function"]["parameters"]["properties"]["plugin_options"]["properties"]
+        self.assertNotIn("custom.maibot-fishaudio-voice-pro.voice_reply", reply_plugin_props)
+        self.assertIn("other.plugin.extra", reply_plugin_props)
+
+    async def test_voice_reply_extension_temperature_gating_and_transform(self) -> None:
+        plugin = self._build_plugin(auto_voice={"mode": "planner", "planner_temperature": 0.3, "max_segment_chars": 80})
+
+        async def fake_synth(text: str, **kwargs: Any) -> dict[str, Any]:
+            raw = f"VOICE:{text}".encode("utf-8")
+            return {
+                "success": True,
+                "audio_base64": base64.b64encode(raw).decode("ascii"),
+                "audio_bytes_len": len(raw),
+                "text": text,
+            }
+
+        plugin._tts_service.synthesize = AsyncMock(side_effect=fake_synth)  # noqa: SLF001
+
+        # prepare 必须返回空字典，确保兼容 passive_replyer 与 active reply 工具两种模式
+        self.assertEqual(await plugin.voice_reply_extension(phase="prepare", parameters={}), {})
+
+        sample_messages = [
+            {"segments": [{"type": "text", "data": "[laughing] 早安呀。今天开心吗？"}], "quote_previous": True},
+            {"segments": [{"type": "emoji", "data": "笑", "hash": "abc", "binary_data_base64": "AAAA"}], "quote_previous": False},
+        ]
+
+        # 温度 0.3 要求 suitability >= 0.7；suitability=0.5 且非明确要求应被过滤并剥离舞台标签保留文字
+        res_filtered = await plugin.voice_reply_extension(
+            phase="before_send",
+            parameters={"use_voice": True, "explicit_request": False, "suitability": 0.5},
+            messages=sample_messages,
+        )
+        self.assertIn("messages", res_filtered)
+        self.assertEqual(res_filtered["messages"][0]["segments"], [{"type": "text", "data": "早安呀。今天开心吗？"}])
+        plugin._tts_service.synthesize.assert_not_awaited()  # noqa: SLF001
+
+        # 温度降至 0.0 时，若 explicit_request=True（用户明确要求发语音）仍可直接放行
+        plugin.config.auto_voice.planner_temperature = 0.0
+        res_explicit = await plugin.voice_reply_extension(
+            phase="before_send",
+            parameters={"use_voice": True, "explicit_request": True, "suitability": 0.2, "style": "gentle"},
+            messages=sample_messages,
+        )
+        self.assertIn("messages", res_explicit)
+        out_msgs = res_explicit["messages"]
+        self.assertEqual(len(out_msgs), 3)
+        self.assertEqual(out_msgs[0]["segments"][0]["type"], "voice")
+        self.assertEqual(out_msgs[0]["segments"][0]["data"], "[laughing] 早安呀。")
+        self.assertFalse(out_msgs[0]["quote_previous"])
+        self.assertEqual(out_msgs[1]["segments"][0]["type"], "voice")
+        self.assertEqual(out_msgs[1]["segments"][0]["data"], "今天开心吗？")
+        # 表情附件消息必须原样保留
+        self.assertEqual(out_msgs[2]["segments"][0]["type"], "emoji")
+
+        # 验证输出格式符合 MaiBot ReplyExtension 协议契约
+        for msg in out_msgs:
+            self.assertEqual(set(msg.keys()), {"segments", "quote_previous"})
+            self.assertIs(type(msg["quote_previous"]), bool)
+            self.assertTrue(isinstance(msg["segments"], list) and len(msg["segments"]) > 0)
+            for seg in msg["segments"]:
+                if seg["type"] == "voice":
+                    self.assertIsInstance(seg["data"], str)
+                    decoded = base64.b64decode(seg["binary_data_base64"], validate=True)
+                    self.assertTrue(len(decoded) > 0)
+
+        # 局部合成失败时：已合成段发语音，未合成段清洗标签后保留文字
+        plugin.config.auto_voice.planner_temperature = 0.8
+        plugin._tts_service.synthesize = AsyncMock(  # noqa: SLF001
+            side_effect=[
+                {"success": True, "audio_base64": base64.b64encode(b"OK").decode("ascii"), "audio_bytes_len": 2, "text": "第一句。"},
+                {"success": False, "error": "upstream 503"},
+            ]
+        )
+        res_partial = await plugin.voice_reply_extension(
+            phase="before_send",
+            parameters={"use_voice": True, "suitability": 0.6},
+            messages=[{"segments": [{"type": "text", "data": "第一句。[sighs] 第二句。"}], "quote_previous": True}],
+        )
+        self.assertEqual(len(res_partial["messages"]), 2)
+        self.assertEqual(res_partial["messages"][0]["segments"][0]["type"], "voice")
+        self.assertEqual(res_partial["messages"][1]["segments"], [{"type": "text", "data": "第二句。"}])
+        self.assertTrue(res_partial["messages"][1]["quote_previous"])
+
+        # 关闭文字降级且首段失败时应显式抛错交由 Replyer/reply 链路处理
+        plugin.config.fallback.fallback_to_text = False
+        plugin._tts_service.synthesize = AsyncMock(return_value={"success": False, "error": "tts down"})  # noqa: SLF001
+        with self.assertRaises(RuntimeError):
+            await plugin.voice_reply_extension(
+                phase="before_send",
+                parameters={"use_voice": True, "suitability": 0.9},
+                messages=[{"segments": [{"type": "text", "data": "测试失败不退回"}], "quote_previous": False}],
+            )
+
+    async def test_probability_mode_sampling_ttl_and_voice_quote_guard(self) -> None:
+        plugin = self._build_plugin(
+            auto_voice={"mode": "probability", "random_probability": 0.4, "decision_ttl_seconds": 8.0}
+        )
+        plugin._tts_service.synthesize = AsyncMock(  # noqa: SLF001
+            return_value={
+                "success": True,
+                "audio_base64": base64.b64encode(b"PROB_MP3").decode("ascii"),
+                "audio_bytes_len": 8,
+                "text": "随机语音测试",
+            }
+        )
+
+        # 首次掷骰 0.2 < 0.4 -> 命中语音；第二次仍在 TTL 内即使 random 返回 0.9 也复用缓存结果
+        with patch.object(plugin_mod.random, "random", side_effect=[0.2, 0.9]):
+            r1 = await plugin.auto_voice_hook(
+                message={"session_id": "s_prob", "raw_message": [{"type": "text", "data": "随机语音测试"}]},
+                set_reply=False,
+            )
+            r2 = await plugin.auto_voice_hook(
+                message={"session_id": "s_prob", "raw_message": [{"type": "text", "data": "随机语音测试"}]},
+                set_reply=False,
+            )
+        assert r1 is not None and r2 is not None
+        self.assertEqual(r1["modified_kwargs"]["message"]["raw_message"][0]["type"], "voice")
+        self.assertEqual(r2["modified_kwargs"]["message"]["raw_message"][0]["type"], "voice")
+
+        # 热重载清空决策缓存且 random=0.9 >= 0.4 -> 不转语音放行原文
+        await plugin.on_config_update(scope="self")
+        with patch.object(plugin_mod.random, "random", return_value=0.9):
+            r3 = await plugin.auto_voice_hook(
+                message={"session_id": "s_prob", "raw_message": [{"type": "text", "data": "保持文字"}]},
+                set_reply=False,
+            )
+        self.assertIsNone(r3)
+
+        # planner 模式下：普通文字消息直接放行；已有 voice 段且带 set_reply=True 时自动清掉引用标记保护投递
+        plugin.config.auto_voice.mode = "planner"
+        self.assertIsNone(
+            await plugin.auto_voice_hook(
+                message={"session_id": "s_p", "raw_message": [{"type": "text", "data": "Planner 决定发文字"}]},
+                set_reply=True,
+            )
+        )
+        voice_guard = await plugin.auto_voice_hook(
+            message={"session_id": "s_p", "raw_message": [{"type": "voice", "data": "hi", "binary_data_base64": "AAAA"}]},
+            set_reply=True,
+            reply_message_id="m_123",
+        )
+        assert voice_guard is not None
+        self.assertFalse(voice_guard["modified_kwargs"]["set_reply"])
+        self.assertEqual(voice_guard["modified_kwargs"]["reply_message_id"], "")
+
+    async def test_mode_and_slider_boundary_conditions(self) -> None:
+        """测试 4 种触发模式与双滑块 0.0/0.5/1.0 边界值及 explicit_request=True。"""
+        # 1. _should_allow_planner_voice 算法各温度与契合度、显式要求边界
+        should_allow = plugin_mod._should_allow_planner_voice
+
+        # 1.1 温度 0.0（极度克制）：非明确要求一律为 False，即便契合度 1.0 也必须被拦截
+        self.assertFalse(should_allow(0.0, explicit_request=False, suitability=1.0))
+        self.assertFalse(should_allow(0.0, explicit_request=False, suitability=0.0))
+        # 但 explicit_request=True 时必须无条件放行，哪怕 suitability=0.0
+        self.assertTrue(should_allow(0.0, explicit_request=True, suitability=0.0))
+
+        # 1.2 温度 1.0（极高倾向）：只要模型调用语音扩展，哪怕 suitability=0.0 也放行
+        self.assertTrue(should_allow(1.0, explicit_request=False, suitability=0.0))
+        self.assertTrue(should_allow(1.0, explicit_request=True, suitability=0.0))
+
+        # 1.3 温度 0.5（均衡自然）：门槛阈值为 1.0 - 0.5 = 0.5
+        self.assertTrue(should_allow(0.5, explicit_request=False, suitability=0.5))
+        self.assertTrue(should_allow(0.5, explicit_request=False, suitability=0.51))
+        self.assertFalse(should_allow(0.5, explicit_request=False, suitability=0.49))
+        self.assertTrue(should_allow(0.5, explicit_request=True, suitability=0.1))
+
+        # 1.4 越界温度自动归一化 clamp ( <0.0 按 0.0 处理, >1.0 按 1.0 处理 )
+        self.assertFalse(should_allow(-0.5, explicit_request=False, suitability=1.0))
+        self.assertTrue(should_allow(-0.5, explicit_request=True, suitability=0.0))
+        self.assertTrue(should_allow(1.5, explicit_request=False, suitability=0.0))
+
+        # 2. _should_convert_by_probability 随机概率滑块边界
+        plugin = self._build_plugin()
+        # prob=0.0: 决策必须恒为 False，且不产生缓存干扰
+        dec_0, _ = plugin._should_convert_by_probability("s_zero", 0.0, ttl_seconds=0.0)
+        self.assertFalse(dec_0)
+        # prob=1.0: 决策必须恒为 True
+        dec_1, _ = plugin._should_convert_by_probability("s_one", 1.0, ttl_seconds=0.0)
+        self.assertTrue(dec_1)
+        # 越界 clamp 测试
+        dec_neg, _ = plugin._should_convert_by_probability("s_neg", -0.2, ttl_seconds=0.0)
+        self.assertFalse(dec_neg)
+        dec_over, _ = plugin._should_convert_by_probability("s_over", 1.5, ttl_seconds=0.0)
+        self.assertTrue(dec_over)
+
+        # 3. 4 种触发模式在 send_service.before_send (auto_voice_hook) 下的行为
+        async def fake_synth(text: str, **kwargs: Any) -> dict[str, Any]:
+            raw = f"VOICE:{text}".encode("utf-8")
+            return {
+                "success": True,
+                "audio_base64": base64.b64encode(raw).decode("ascii"),
+                "audio_bytes_len": len(raw),
+                "text": text,
+            }
+
+        plugin._tts_service.synthesize = AsyncMock(side_effect=fake_synth)
+        sample_msg = {"session_id": "stream_mode_test", "raw_message": [{"type": "text", "data": "测试四种模式表现"}]}
+
+        # 3.1 mode="off": auto_voice_hook 必须直接返回 None（不转语音）
+        plugin.config.auto_voice.mode = "off"
+        self.assertIsNone(
+            await plugin.auto_voice_hook(
+                message={"session_id": "stream_off", "raw_message": [{"type": "text", "data": "测试四种模式表现"}]},
+                set_reply=False,
+            )
+        )
+
+        # 3.2 mode="planner": auto_voice_hook 必须直接返回 None（交由 ReplyExtension 处理，不盲转）
+        plugin.config.auto_voice.mode = "planner"
+        self.assertIsNone(
+            await plugin.auto_voice_hook(
+                message={"session_id": "stream_planner", "raw_message": [{"type": "text", "data": "测试四种模式表现"}]},
+                set_reply=False,
+            )
+        )
+
+        # 3.3 mode="probability" 且 random_probability=0.0: 恒不转语音
+        plugin.config.auto_voice.mode = "probability"
+        plugin.config.auto_voice.random_probability = 0.0
+        self.assertIsNone(
+            await plugin.auto_voice_hook(
+                message={"session_id": "stream_prob_0", "raw_message": [{"type": "text", "data": "测试四种模式表现"}]},
+                set_reply=False,
+            )
+        )
+
+        # 3.4 mode="probability" 且 random_probability=1.0: 恒转语音
+        plugin.config.auto_voice.random_probability = 1.0
+        res_prob_1 = await plugin.auto_voice_hook(
+            message={"session_id": "stream_prob_1", "raw_message": [{"type": "text", "data": "测试四种模式表现"}]},
+            set_reply=False,
+        )
+        assert res_prob_1 is not None
+        self.assertEqual(res_prob_1["modified_kwargs"]["message"]["raw_message"][0]["type"], "voice")
+
+        # 3.5 mode="always": 恒转语音
+        plugin.config.auto_voice.mode = "always"
+        res_always = await plugin.auto_voice_hook(
+            message={"session_id": "stream_always", "raw_message": [{"type": "text", "data": "测试四种模式表现"}]},
+            set_reply=False,
+        )
+        assert res_always is not None
+        self.assertEqual(res_always["modified_kwargs"]["message"]["raw_message"][0]["type"], "voice")
+
+    async def test_voice_reply_extension_non_planner_and_deferred_temp_cleanup(self) -> None:
+        """测试 voice_reply 扩展在非 planner 模式下的文字保全，以及延迟临时文件清理机制。"""
+        # 1. 在非 planner 模式（off, always, probability）下，voice_reply_extension 不应合成语音，应剥离标签保留文字
+        sample_messages = [
+            {"segments": [{"type": "text", "data": "[whispering] 这是私聊悄悄话。"}], "quote_previous": True}
+        ]
+        for non_planner_mode in ("off", "always", "probability"):
+            plugin_np = self._build_plugin(auto_voice={"mode": non_planner_mode})
+            plugin_np._tts_service.synthesize = AsyncMock()
+            res_np = await plugin_np.voice_reply_extension(
+                phase="before_send",
+                parameters={"use_voice": True, "suitability": 1.0},
+                messages=sample_messages,
+            )
+            plugin_np._tts_service.synthesize.assert_not_awaited()
+            self.assertIn("messages", res_np)
+            self.assertEqual(res_np["messages"][0]["segments"][0]["data"], "这是私聊悄悄话。")
+
+        # 2. 延迟临时文件清理 (defer_immediate_cleanup)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            plugin_storage = self._build_plugin(
+                auto_voice={"mode": "planner", "planner_temperature": 0.8},
+                storage={
+                    "save_output_audio": True,
+                    "output_dir": str(out_dir),
+                    "auto_delete": True,
+                    "retain_minutes": 0,
+                    "max_saved_files": 100,
+                },
+            )
+
+            async def fake_synth_storage(text: str, **kwargs: Any) -> dict[str, Any]:
+                return {
+                    "success": True,
+                    "audio_base64": base64.b64encode(b"TEMP_VOICE_PAYLOAD").decode("ascii"),
+                    "audio_bytes_len": 18,
+                    "text": text,
+                }
+
+            plugin_storage._tts_service.synthesize = AsyncMock(side_effect=fake_synth_storage)
+            res_ext = await plugin_storage.voice_reply_extension(
+                phase="before_send",
+                parameters={"use_voice": True, "suitability": 0.9},
+                messages=[{"segments": [{"type": "text", "data": "测试延迟临时文件清理。"}], "quote_previous": False}],
+            )
+            self.assertEqual(res_ext["messages"][0]["segments"][0]["type"], "voice")
+            # 确认 finally 块已触发 _cleanup_deferred_files，临时落盘的文件已全部被清除
+            leftover = [p for p in out_dir.iterdir() if p.name.startswith("fishaudio_")]
+            self.assertEqual(leftover, [])
+
+    async def test_planner_before_request_non_planner_modes_and_standalone_option_cleanup(self) -> None:
+        """测试 planner_before_request 在 off/always 模式下的清理与 reply plugin_options 独占清理。"""
+        # 当 reply 工具的 plugin_options 仅有 voice_reply 这一个扩展时，清理后应彻底移除 plugin_options 键
+        single_ext_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "reply",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "chat_anlyze": {"type": "string"},
+                            "plugin_options": {
+                                "type": "object",
+                                "properties": {
+                                    "custom.maibot-fishaudio-voice-pro.voice_reply": {"type": "object"},
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {"name": "send_voice_reply", "parameters": {"type": "object", "properties": {}}},
+            },
+        ]
+        items = [
+            {"item_type": "SystemMessageItem", "meta": {"item_id": "fishaudio-voice-planner-1"}, "parts": [{"type": "text", "text": "old"}]},
+            {"item_type": "UserMessageItem", "meta": {"item_id": "u1"}, "parts": [{"type": "text", "text": "hi"}]},
+        ]
+
+        # mode="off": 移除注入项，隐藏 send_voice_reply，且 plugin_options 被整键 pop
+        p_off = self._build_plugin(auto_voice={"mode": "off"})
+        res_off = await p_off.planner_before_request_hook(items=items, tool_definitions=single_ext_tools, session_id="s_off")
+        assert res_off is not None
+        mod_tools = res_off["modified_kwargs"]["tool_definitions"]
+        self.assertEqual(len(mod_tools), 1)
+        self.assertEqual(mod_tools[0]["function"]["name"], "reply")
+        self.assertNotIn("plugin_options", mod_tools[0]["function"]["parameters"]["properties"])
+        mod_items = res_off["modified_kwargs"]["items"]
+        self.assertEqual(len(mod_items), 1)
+        self.assertEqual(mod_items[0]["meta"]["item_id"], "u1")
+
+        # mode="always": 行为与 off 一致（出站由 before_send 处理，Planner 不应调用扩展或工具）
+        p_always = self._build_plugin(auto_voice={"mode": "always"})
+        res_always = await p_always.planner_before_request_hook(items=items, tool_definitions=single_ext_tools, session_id="s_alw")
+        assert res_always is not None
+        mod_tools_alw = res_always["modified_kwargs"]["tool_definitions"]
+        self.assertNotIn("plugin_options", mod_tools_alw[0]["function"]["parameters"]["properties"])
+
+        # 检查温度档位描述生成 0.0, 0.5, 1.0
+        p_planner = self._build_plugin(auto_voice={"mode": "planner", "planner_temperature": 0.0})
+        res_t0 = await p_planner.planner_before_request_hook(items=[{"item_type": "UserMessageItem", "meta": {"item_id": "u1"}, "parts": []}], tool_definitions=[], session_id="s0")
+        self.assertIn("极度克制（仅明确要求）", res_t0["modified_kwargs"]["items"][0]["parts"][0]["text"])
+
+        p_planner.config.auto_voice.planner_temperature = 0.5
+        res_t5 = await p_planner.planner_before_request_hook(items=[{"item_type": "UserMessageItem", "meta": {"item_id": "u1"}, "parts": []}], tool_definitions=[], session_id="s5")
+        self.assertIn("均衡自然", res_t5["modified_kwargs"]["items"][0]["parts"][0]["text"])
+
+        p_planner.config.auto_voice.planner_temperature = 1.0
+        res_t10 = await p_planner.planner_before_request_hook(items=[{"item_type": "UserMessageItem", "meta": {"item_id": "u1"}, "parts": []}], tool_definitions=[], session_id="s10")
+        self.assertIn("极高倾向", res_t10["modified_kwargs"]["items"][0]["parts"][0]["text"])
+
+    async def test_on_config_update_three_args_and_reported_plugin_options(self) -> None:
+        """验证热重载兼容宿主 3 参数调用，且 suitability=0.85/use_voice=True 正常触发语音并记录跳过原因。"""
+        plugin = self._build_plugin(auto_voice={"mode": "planner", "planner_temperature": 0.5})
+        old_service = plugin._tts_service  # noqa: SLF001
+        assert old_service is not None
+        old_service.close = AsyncMock()
+
+        # 模拟 MaiBot Runner 传入 (scope, config_data, config_version) 三个位置参数
+        await plugin.on_config_update("self", {"auto_voice": {"mode": "planner", "planner_temperature": 0.9}}, "1.1.0")
+        old_service.close.assert_awaited_once()
+        self.assertIsNot(plugin._tts_service, old_service)  # noqa: SLF001
+
+        plugin._tts_service.synthesize = AsyncMock(  # noqa: SLF001
+            return_value={
+                "success": True,
+                "audio_base64": base64.b64encode(b"OK_085").decode("ascii"),
+                "audio_bytes_len": 6,
+                "text": "多看两眼怎么了",
+            }
+        )
+        # 复现用户上报的参数组合（不含 voice 键，explicit_request=False, style="", suitability=0.85, use_voice=True）
+        res_085 = await plugin.voice_reply_extension(
+            phase="before_send",
+            parameters={
+                "explicit_request": False,
+                "style": "",
+                "suitability": 0.85,
+                "use_voice": True,
+            },
+            messages=[{"segments": [{"type": "text", "data": "多看两眼怎么了"}], "quote_previous": True}],
+        )
+        self.assertEqual(res_085["messages"][0]["segments"][0]["type"], "voice")
+        self.assertFalse(res_085["messages"][0]["quote_previous"])
+
+        # 含 URL 时应跳过转语音并记录清晰原因日志
+        with self.assertLogs("fishaudio.test", level="INFO") as captured:
+            res_url = await plugin.voice_reply_extension(
+                phase="before_send",
+                parameters={"explicit_request": False, "style": "", "suitability": 0.85, "use_voice": True},
+                messages=[{"segments": [{"type": "text", "data": "[laughing] 看这里 https://example.com"}], "quote_previous": True}],
+            )
+        self.assertEqual(res_url["messages"][0]["segments"][0]["data"], "看这里 https://example.com")
+        self.assertTrue(any("包含跳过模式" in msg for msg in captured.output))
 
 
 if __name__ == "__main__":
