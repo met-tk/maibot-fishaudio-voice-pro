@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import difflib
 import logging
 import random
 import re
@@ -25,6 +26,7 @@ import maibot_sdk
 from maibot_sdk import (
     API,
     CONFIG_RELOAD_SCOPE_SELF,
+    Command,
     Field,
     HookHandler,
     MaiBotPlugin,
@@ -119,7 +121,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "order": 1},
     )
     config_version: str = Field(
-        default="1.1.0",
+        default="1.2.0",
         description="配置文件版本号",
         json_schema_extra={"label": "配置版本", "order": 2},
     )
@@ -591,12 +593,97 @@ class StorageSectionConfig(PluginConfigBase):
     )
 
 
+class EmotionSectionConfig(PluginConfigBase):
+    """Fish Audio 行内情绪与语气标签自动注入配置。"""
+
+    __ui_label__ = "情绪与语气自动注入"
+
+    enabled: bool = Field(
+        default=True,
+        description="是否在语音合成前自动分析台词并将情绪与语气标签（如 [开心的语气]、[平静]、[语气激动]、[哼歌]）注入到语句中",
+        json_schema_extra={"label": "启用情绪参数自动注入", "order": 1},
+    )
+    mode: Literal["hybrid", "llm", "rule"] = Field(
+        default="hybrid",
+        description=(
+            "情绪注入模式：hybrid（优先调用宿主大模型细腻标注，超时或失败时自动回退本地规则）、"
+            "llm（仅使用宿主大模型智能标注，失败时保留原文）、"
+            "rule（纯本地启发式规则零延迟注入，不调用大模型）"
+        ),
+        json_schema_extra={
+            "label": "情绪注入模式",
+            "order": 2,
+            "i18n": {
+                "zh-CN": {
+                    "choice:hybrid": "智能混合：LLM 优先 + 规则兜底 (hybrid)",
+                    "choice:llm": "仅宿主大模型注入 (llm)",
+                    "choice:rule": "仅本地规则零延迟注入 (rule)",
+                }
+            },
+        },
+    )
+    model_task: str = Field(
+        default="",
+        description="调用宿主 ctx.llm.generate 时指定的模型任务名或具体模型名（留空使用宿主默认模型任务；也可填 utils、replyer 等）",
+        json_schema_extra={
+            "label": "LLM 模型任务名 (model_task)",
+            "order": 3,
+            "placeholder": "留空使用默认，或填 utils",
+        },
+    )
+    temperature: float = Field(
+        default=0.3,
+        ge=0.0,
+        le=1.0,
+        description="情绪标注大模型的采样温度（0.0 - 1.0，越低越稳定保守，越高情绪变化越丰富）",
+        json_schema_extra={
+            "label": "情绪标注温度",
+            "x-widget": "slider",
+            "step": 0.05,
+            "order": 4,
+        },
+    )
+    timeout_seconds: float = Field(
+        default=8.0,
+        ge=1.0,
+        le=30.0,
+        description="单次 LLM 情绪标注的最大等待秒数（超时立即无感回退，不阻塞语音合成）",
+        json_schema_extra={"label": "LLM 标注超时（秒）", "order": 5},
+    )
+    tag_presets: str = Field(
+        default="开心的语气, 平静, 语气激动, 温柔, 撒娇, 哼歌, 小声说话, 叹气, 轻笑, 疑惑, 委屈, 严肃, 俏皮, 惊讶",
+        description="推荐使用的情绪、语气与副语言标签参考列表（逗号分隔，会作为优先词汇提供给标注器；Fish Audio S2 系列同时支持开放式自然语言标签）",
+        json_schema_extra={"label": "常用情绪标签参考库", "order": 6},
+    )
+    custom_instruction: str = Field(
+        default="",
+        description="可选的额外配音导演指令（例如限定角色性格基调：整体偏俏皮活泼，句尾喜欢哼歌），留空按通用规则标注",
+        json_schema_extra={"label": "自定义配音导演附加要求", "order": 7},
+    )
+    skip_if_already_tagged: bool = Field(
+        default=True,
+        description="若待合成台词中已包含 [标签] 或 (标签) 形式的情绪标记，则直接沿用不再重复注入",
+        json_schema_extra={"label": "已带标签时跳过注入", "order": 8},
+    )
+    show_injected_text: bool = Field(
+        default=True,
+        description="是否在语音消息元信息、WebUI 观察面板及出站日志中显示带 [情绪标签] 的实际转换文本（语音失败降级发文字时仍会自动剥离标签）",
+        json_schema_extra={"label": "展示带标签的转换文本", "order": 9},
+    )
+    send_injected_text_to_chat: bool = Field(
+        default=False,
+        description="是否在发送语音时同步在聊天窗口发一条带 [情绪标签] 的实际转换文本预览（便于边听语音边核对标签效果）",
+        json_schema_extra={"label": "聊天窗口同步发送转换文本", "order": 10},
+    )
+
+
 class FishAudioPluginConfig(PluginConfigBase):
     """Fish Audio TTS 插件顶层配置模型。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     voice: VoiceSectionConfig = Field(default_factory=VoiceSectionConfig)
     auto_voice: AutoVoiceSectionConfig = Field(default_factory=AutoVoiceSectionConfig)
+    emotion: EmotionSectionConfig = Field(default_factory=EmotionSectionConfig)
     storage: StorageSectionConfig = Field(default_factory=StorageSectionConfig)
     generation: GenerationSectionConfig = Field(default_factory=GenerationSectionConfig)
     request: RequestSectionConfig = Field(default_factory=RequestSectionConfig)
@@ -651,6 +738,388 @@ def apply_style_instruction(text: str, style_instruction: str, model: str) -> st
     return f"{tag} {raw}"
 
 
+_CODE_FENCE_RE = re.compile(r"^```[^\r\n]*\r?\n(.*?)\r?\n```$", re.DOTALL)
+_INJECT_PREFIX_RE = re.compile(r"^(?:注入后(?:文本|结果)?|标注后(?:文本|结果)?|修改后(?:文本|结果)?|输出|结果)\s*[：:]\s*")
+_RULE_SENT_BOUNDARY_RE = re.compile(
+    r"(?:[。！？!?]+[”’\"'」』）)]*|(?<!\d)\.(?!\d)(?=\s|$)[”’\"'」』）)]*|[~～]+(?=\s|$)|\r?\n)"
+)
+_REPEAT_AAA_OR_AABB_RE = re.compile(r"([\u4e00-\u9fff])\1\1|([\u4e00-\u9fff])\2([\u4e00-\u9fff])\3")
+_RULE_HUMMING_KEYWORDS = (
+    "嘿咻嘿咻",
+    "啦啦啦",
+    "啦啦",
+    "哼哼",
+    "哒哒哒",
+    "噜噜",
+    "嘟嘟噜",
+    "叮咚",
+    "咻咻",
+)
+_RULE_HAPPY_PREFIX_RE = re.compile(
+    r"^(?:嘿嘿|哈哈|嘻嘻|好耶|太棒|太好|哇塞|哇啊|哇|耶|快看|超开心|真开心)"
+)
+_RULE_MID_EXCITED_RE = re.compile(
+    r"(?:对着你|冲着你|朝你|向你|让你|把你|给你|就要|非要|立刻|马上|直接|疯狂|使劲|拼命)[^\u4e00-\u9fff]{0,2}"
+    r"(?=([\u4e00-\u9fff])\1\1|([\u4e00-\u9fff])\2([\u4e00-\u9fff])\3)"
+)
+_RULE_CONDITIONAL_HEAD_RE = re.compile(
+    r"^(?:如果|只要|只有|因为|既然|虽然|其实|本来|要是|假如|万一|不然|否则)"
+)
+_RULE_STRONG_EXCITED_WORDS = (
+    "天呐",
+    "天哪",
+    "救命",
+    "好家伙",
+    "气死",
+    "烦死",
+    "可恶",
+    "绝了",
+    "好厉害",
+    "太强了",
+    "冲鸭",
+    "千万别",
+    "绝对不行",
+)
+
+
+def format_emotion_tag(tag_body: str, model: str = "s2.1-pro-free") -> str:
+    """按目标 Fish Audio 模型语法格式化单个情绪/语气标签。"""
+    cleaned = _STYLE_BLOCK_RE.sub("", str(tag_body or "")).strip()
+    cleaned = cleaned.strip("[]()（）").strip()
+    if not cleaned:
+        return ""
+    if (model or "").strip().lower() == "s1":
+        return f"({cleaned})"
+    return f"[{cleaned}]"
+
+
+def has_inline_emotion_tags(text: str) -> bool:
+    """判断文本中是否已包含行内方括号情绪标签。"""
+    return bool(_SQUARE_TAG_RE.search(text or ""))
+
+
+def _visible_tts_length(text: str) -> int:
+    """计算剥离行内方括号标签后的可朗读净文本长度。"""
+    return len(_SQUARE_TAG_RE.sub("", text or ""))
+
+
+def _extract_inline_tags(
+    text: str,
+    *,
+    reference_plain: str = "",
+    model: str = "s2.1-pro-free",
+) -> tuple[str, dict[int, list[str]]]:
+    """从候选文本中剥离行内标签，并返回 (去标签纯文本, {纯文本偏移: [规范化标签...]})。"""
+    raw = text or ""
+    matches: list[tuple[int, int, str]] = [
+        (m.start(), m.end(), m.group(0)[1:-1]) for m in _SQUARE_TAG_RE.finditer(raw)
+    ]
+    if not matches:
+        for pattern in (_EN_PAREN_TAG_RE, _CN_PAREN_TAG_RE):
+            for m in pattern.finditer(raw):
+                snippet = m.group(0)
+                # 仅提取原台词中原本不存在的新增括号标签，防止误伤正文括号补充说明
+                if not reference_plain or snippet not in reference_plain:
+                    matches.append((m.start(), m.end(), snippet[1:-1]))
+        matches.sort(key=lambda item: item[0])
+
+    plain_chunks: list[str] = []
+    tags_by_pos: dict[int, list[str]] = {}
+    plain_len = 0
+    cursor = 0
+    for start, end, body in matches:
+        if start < cursor:
+            continue
+        if start > cursor:
+            segment = raw[cursor:start]
+            plain_chunks.append(segment)
+            plain_len += len(segment)
+        formatted = format_emotion_tag(body, model=model)
+        if formatted:
+            tags_by_pos.setdefault(plain_len, []).append(formatted)
+        cursor = end
+
+    if cursor < len(raw):
+        plain_chunks.append(raw[cursor:])
+
+    return "".join(plain_chunks), tags_by_pos
+
+
+def _clean_llm_emotion_candidate(candidate_text: str, original_text: str) -> str:
+    """清洗 LLM 返回结果中可能掺杂的代码块围栏、提示前缀或多余外层引号。"""
+    cleaned = (candidate_text or "").strip()
+    fence_match = _CODE_FENCE_RE.match(cleaned)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
+    prefix_match = _INJECT_PREFIX_RE.match(cleaned)
+    if prefix_match and not _INJECT_PREFIX_RE.match(original_text.strip()):
+        cleaned = cleaned[prefix_match.end() :].strip()
+
+    for left_q, right_q in (('"', '"'), ("'", "'"), ("“", "”"), ("「", "」")):
+        if (
+            len(cleaned) >= 2
+            and cleaned.startswith(left_q)
+            and cleaned.endswith(right_q)
+            and not (original_text.startswith(left_q) and original_text.endswith(right_q))
+        ):
+            cleaned = cleaned[1:-1].strip()
+            break
+    return cleaned
+
+
+def reconcile_injected_text(
+    original_text: str,
+    candidate_text: str,
+    model: str = "s2.1-pro-free",
+) -> Optional[str]:
+    """校对并锚定注入标签后的文本，确保原始台词一字不改；差异过大则返回 None。"""
+    orig = original_text or ""
+    if not orig.strip():
+        return None
+
+    cleaned_cand = _clean_llm_emotion_candidate(candidate_text, orig)
+    if not cleaned_cand:
+        return None
+
+    cand_plain, tags_by_cand_pos = _extract_inline_tags(
+        cleaned_cand,
+        reference_plain=orig,
+        model=model,
+    )
+    if not tags_by_cand_pos:
+        return None
+
+    cand_compact = re.sub(r"\s+", "", cand_plain)
+    orig_compact = re.sub(r"\s+", "", orig)
+    if not cand_compact:
+        return None
+
+    matcher = difflib.SequenceMatcher(None, cand_plain, orig)
+    if cand_plain != orig:
+        compact_ratio = difflib.SequenceMatcher(None, cand_compact, orig_compact).ratio()
+        if max(matcher.ratio(), compact_ratio) < 0.75:
+            return None
+
+    cand_to_orig: list[int] = [len(orig)] * (len(cand_plain) + 1)
+    for tag_op, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag_op == "equal":
+            for k in range(i2 - i1):
+                cand_to_orig[i1 + k] = j1 + k
+        elif tag_op in ("replace", "delete"):
+            for idx in range(i1, i2):
+                cand_to_orig[idx] = j1
+    cand_to_orig[len(cand_plain)] = len(orig)
+
+    tags_by_orig: dict[int, list[str]] = {}
+    for cand_pos, tag_list in sorted(tags_by_cand_pos.items()):
+        orig_pos = cand_to_orig[min(cand_pos, len(cand_plain))]
+        # 忽略句末没有任何后续字符的悬空标签
+        if orig_pos >= len(orig):
+            continue
+        bucket = tags_by_orig.setdefault(orig_pos, [])
+        for tag in tag_list:
+            if not bucket or bucket[-1] != tag:
+                bucket.append(tag)
+
+    if not tags_by_orig:
+        return None
+
+    parts: list[str] = []
+    last_emitted_tag = ""
+    for idx, ch in enumerate(orig):
+        for tag in tags_by_orig.get(idx, ()):
+            if tag != last_emitted_tag:
+                parts.append(tag)
+                last_emitted_tag = tag
+        parts.append(ch)
+    return "".join(parts)
+
+
+def _split_sentence_spans(text: str) -> list[str]:
+    """按句末标点与换行切分文本并 100% 保留原始字符与空白。"""
+    spans: list[str] = []
+    last_end = 0
+    for match in _RULE_SENT_BOUNDARY_RE.finditer(text):
+        end = match.end()
+        if end > last_end:
+            spans.append(text[last_end:end])
+        last_end = end
+    if last_end < len(text):
+        spans.append(text[last_end:])
+    return spans
+
+
+def _analyze_sentence_emotion(core: str, *, is_first: bool) -> tuple[str, Optional[tuple[int, str]]]:
+    """基于语义与标点特征分析单个句子的开场情绪及可选句中激动突变位置。"""
+    trimmed = core.rstrip("”’\"'」』）) \t")
+    body = core.rstrip("。！？!?~～”’\"'」』）) \t")
+
+    if any(kw in body for kw in _RULE_HUMMING_KEYWORDS):
+        return "哼歌", None
+    if trimmed.endswith(("~", "～")) and not any(q in core for q in ("？", "?")) and len(body) <= 24:
+        if re.search(r"([\u4e00-\u9fff])\1|([\u4e00-\u9fff]{2})\2", body):
+            return "哼歌", None
+
+    if _RULE_HAPPY_PREFIX_RE.match(body) and not _RULE_CONDITIONAL_HEAD_RE.match(body):
+        return "开心的语气", None
+    if any(kw in body for kw in ("好开心", "超开心", "太开心", "真开心", "太棒啦", "太好啦")):
+        if not any(neg in body for neg in ("不开心", "难过", "委屈")):
+            return "开心的语气", None
+
+    if any(kw in body for kw in ("噗嗤", "呵呵", "偷笑", "忍不住笑")):
+        return "轻笑", None
+    if re.match(r"^(?:唉|算了吧|好累|好无奈)", body) or "叹气" in body:
+        return "叹气", None
+    if any(kw in body for kw in ("呜呜", "呜哇", "好委屈", "欺负我", "好难过")):
+        return "委屈", None
+    if any(kw in body for kw in ("偷偷告诉", "小声", "悄悄", "嘘")):
+        return "小声说话", None
+    if any(kw in body for kw in ("晚安", "好梦", "早点睡", "抱抱", "摸摸头", "辛苦啦", "别难过")):
+        return "温柔", None
+    if trimmed.endswith(("？", "?")):
+        return "疑惑", None
+
+    is_exclam = trimmed.endswith(("！", "!"))
+    if is_exclam:
+        mid_match = _RULE_MID_EXCITED_RE.search(core)
+        if mid_match is not None and mid_match.end() >= 4:
+            return "平静", (mid_match.end(), "语气激动")
+
+        if _RULE_CONDITIONAL_HEAD_RE.match(body):
+            comma_idx = max(core.find("，"), core.find(","))
+            if comma_idx >= 3:
+                after_comma = core[comma_idx + 1 :]
+                dup_match = _REPEAT_AAA_OR_AABB_RE.search(after_comma)
+                if dup_match is not None:
+                    return "平静", (comma_idx + 1 + dup_match.start(), "语气激动")
+
+        is_long_conditional = bool(_RULE_CONDITIONAL_HEAD_RE.match(body)) and len(body) > 14
+        if not is_long_conditional:
+            if "！！" in core or "!!" in core:
+                return "语气激动", None
+            if len(body) <= 18 and _REPEAT_AAA_OR_AABB_RE.search(body):
+                return "语气激动", None
+            if any(kw in body for kw in _RULE_STRONG_EXCITED_WORDS):
+                return "语气激动", None
+            if len(body) <= 10 and any(kw in body for kw in ("太棒", "太好", "冲鸭", "加油", "可恶", "讨厌")):
+                return "语气激动", None
+
+    if trimmed.endswith("。") or _RULE_CONDITIONAL_HEAD_RE.match(body) or len(body) >= 12:
+        return "平静", None
+
+    if is_exclam:
+        return "开心的语气", None
+    return ("平静" if is_first else ""), None
+
+
+def inject_emotion_tags_by_rules(text: str, model: str = "s2.1-pro-free") -> str:
+    """使用零延迟本地启发式规则为台词注入行内 Fish Audio 情绪/语气标签。"""
+    raw = text or ""
+    if not raw.strip() or not _SPEAKABLE_CHAR_RE.search(raw):
+        return raw
+
+    spans = _split_sentence_spans(raw)
+    if not spans:
+        return raw
+
+    out_chunks: list[str] = []
+    current_emotion = ""
+    seen_speakable = False
+
+    for span in spans:
+        ws_len = len(span) - len(span.lstrip())
+        leading_ws = span[:ws_len]
+        core = span[ws_len:]
+        if not core or not _SPEAKABLE_CHAR_RE.search(core):
+            out_chunks.append(span)
+            continue
+
+        head_emotion, mid_shift = _analyze_sentence_emotion(core, is_first=not seen_speakable)
+        seen_speakable = True
+
+        head_prefix = ""
+        if head_emotion and head_emotion != current_emotion:
+            head_prefix = format_emotion_tag(head_emotion, model=model)
+            current_emotion = head_emotion
+
+        if mid_shift is not None:
+            shift_idx, mid_emotion = mid_shift
+            mid_tag = format_emotion_tag(mid_emotion, model=model)
+            if mid_tag and 0 < shift_idx < len(core):
+                annotated_core = f"{head_prefix}{core[:shift_idx]}{mid_tag}{core[shift_idx:]}"
+                current_emotion = mid_emotion
+            else:
+                annotated_core = f"{head_prefix}{core}"
+        else:
+            annotated_core = f"{head_prefix}{core}"
+
+        out_chunks.append(f"{leading_ws}{annotated_core}")
+
+    return "".join(out_chunks)
+
+
+def map_annotated_to_segments(
+    segments: Sequence[str],
+    annotated: str,
+    model: str = "s2.1-pro-free",
+) -> list[str]:
+    """将完整注入后的带标签文本精确拆回各个分段，并跨段自动延续活跃情绪标签。"""
+    seg_list = list(segments)
+    if not seg_list:
+        return []
+
+    joined = "\n".join(seg_list)
+    plain, tags_by_pos = _extract_inline_tags(
+        annotated,
+        reference_plain=joined,
+        model=model,
+    )
+    if plain != joined:
+        return [inject_emotion_tags_by_rules(seg, model=model) for seg in seg_list]
+
+    out_segments: list[str] = []
+    cursor = 0
+    active_tag = ""
+    carried_tags: list[str] = []
+
+    for seg_idx, seg in enumerate(seg_list):
+        seg_start = cursor
+        seg_end = seg_start + len(seg)
+        seg_parts: list[str] = []
+        prev_active = active_tag
+
+        start_tags = list(carried_tags) + list(tags_by_pos.get(seg_start, ()))
+        carried_tags = []
+
+        if start_tags:
+            for tag in start_tags:
+                if not seg_parts or seg_parts[-1] != tag:
+                    seg_parts.append(tag)
+                    active_tag = tag
+        elif prev_active and _SPEAKABLE_CHAR_RE.search(seg):
+            seg_parts.append(prev_active)
+
+        for offset_in_seg, ch in enumerate(seg):
+            abs_pos = seg_start + offset_in_seg
+            if offset_in_seg > 0:
+                for tag in tags_by_pos.get(abs_pos, ()):
+                    if tag != active_tag:
+                        seg_parts.append(tag)
+                        active_tag = tag
+            seg_parts.append(ch)
+
+        if seg_idx + 1 < len(seg_list):
+            carried_tags = list(tags_by_pos.get(seg_end, ()))
+            cursor = seg_end + 1
+        else:
+            cursor = seg_end
+
+        out_segments.append("".join(seg_parts))
+
+    return out_segments
+
+
 def _read_transcript(path: Optional[Path], logger: Optional[logging.Logger] = None) -> str:
     """安全读取伴随参考台词 .txt 文件。"""
     if path is None or not path.is_file():
@@ -700,6 +1169,57 @@ def _resolve_plugin_path(raw_dir: str, default_rel: str) -> Path:
     return candidate.resolve()
 
 
+def _tokenize_with_inline_tags(text: str) -> list[tuple[bool, str]]:
+    """将文本拆分为 (是否为行内标签, 片段) 序列，避免硬切分时截断 [标签]。"""
+    tokens: list[tuple[bool, str]] = []
+    pos = 0
+    for match in _SQUARE_TAG_RE.finditer(text):
+        if match.start() > pos:
+            for ch in text[pos : match.start()]:
+                tokens.append((False, ch))
+        tokens.append((True, match.group(0)))
+        pos = match.end()
+    if pos < len(text):
+        for ch in text[pos:]:
+            tokens.append((False, ch))
+    return tokens
+
+
+def _hard_split_preserving_tags(piece: str, limit: int) -> list[str]:
+    """按净可见字符上限切分超长分片，同时保护 [标签] 完整不被劈开。"""
+    if not _SQUARE_TAG_RE.search(piece):
+        return [piece[idx : idx + limit].strip() for idx in range(0, len(piece), limit) if piece[idx : idx + limit].strip()]
+
+    chunks: list[str] = []
+    buf: list[str] = []
+    vis_len = 0
+    for is_tag, token in _tokenize_with_inline_tags(piece):
+        if is_tag:
+            if vis_len >= limit and buf:
+                chunk = "".join(buf).strip()
+                if chunk:
+                    chunks.append(chunk)
+                buf = []
+                vis_len = 0
+            buf.append(token)
+            continue
+
+        if vis_len >= limit and buf:
+            chunk = "".join(buf).strip()
+            if chunk:
+                chunks.append(chunk)
+            buf = []
+            vis_len = 0
+        buf.append(token)
+        vis_len += 1
+
+    if buf:
+        chunk = "".join(buf).strip()
+        if chunk:
+            chunks.append(chunk)
+    return chunks
+
+
 def _pack_fragments(pieces: list[str], limit: int) -> list[str]:
     """将细粒片段按最大长度合并打包，超长单片再做硬切分。"""
     packed: list[str] = []
@@ -708,18 +1228,15 @@ def _pack_fragments(pieces: list[str], limit: int) -> list[str]:
         piece = raw_piece.strip()
         if not piece:
             continue
-        if len(piece) > limit:
+        if _visible_tts_length(piece) > limit:
             if current:
                 packed.append(current)
                 current = ""
-            for idx in range(0, len(piece), limit):
-                chunk = piece[idx : idx + limit].strip()
-                if chunk:
-                    packed.append(chunk)
+            packed.extend(_hard_split_preserving_tags(piece, limit))
             continue
         if not current:
             current = piece
-        elif len(current) + 1 + len(piece) <= limit:
+        elif _visible_tts_length(current) + 1 + _visible_tts_length(piece) <= limit:
             separator = " " if current[-1].isascii() and piece[0].isascii() else ""
             current = f"{current}{separator}{piece}"
         else:
@@ -757,7 +1274,7 @@ def split_tts_segments(
 
     segments: list[str] = []
     for sentence in raw_sentences:
-        if len(sentence) <= limit:
+        if _visible_tts_length(sentence) <= limit:
             if _SPEAKABLE_CHAR_RE.search(sentence):
                 segments.append(sentence)
             continue
@@ -1286,11 +1803,13 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         cfg = self.config
         has_key = bool(str(cfg.voice.fish_api_key or "").strip())
         self._log.info(
-            "Fish Audio TTS 插件已加载 (enabled=%s, auto_mode=%s, planner_temp=%.2f, random_prob=%.2f, model=%s, voice_mode=%s, has_key=%s, local_voices=%d)",
+            "Fish Audio TTS 插件已加载 (enabled=%s, auto_mode=%s, planner_temp=%.2f, random_prob=%.2f, emotion=%s/%s, model=%s, voice_mode=%s, has_key=%s, local_voices=%d)",
             self._is_enabled(),
             self._auto_voice_mode(),
             float(cfg.auto_voice.planner_temperature),
             float(cfg.auto_voice.random_probability),
+            bool(cfg.emotion.enabled),
+            str(cfg.emotion.mode),
             cfg.voice.model,
             cfg.voice.voice_mode,
             has_key,
@@ -1321,12 +1840,14 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             await old_service.close()
         await self._run_storage_prune()
         self._log.info(
-            "Fish Audio TTS 配置已热重载 (version=%s, enabled=%s, auto_mode=%s, planner_temp=%.2f, random_prob=%.2f, model=%s, voice_mode=%s)",
+            "Fish Audio TTS 配置已热重载 (version=%s, enabled=%s, auto_mode=%s, planner_temp=%.2f, random_prob=%.2f, emotion=%s/%s, model=%s, voice_mode=%s)",
             str(version or self.config.plugin.config_version),
             self._is_enabled(),
             self._auto_voice_mode(),
             float(self.config.auto_voice.planner_temperature),
             float(self.config.auto_voice.random_probability),
+            bool(self.config.emotion.enabled),
+            str(self.config.emotion.mode),
             self.config.voice.model,
             self.config.voice.voice_mode,
         )
@@ -1566,6 +2087,231 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             except Exception as exc:  # noqa: BLE001
                 self._log.warning("立即清理输出语音文件失败: %s", exc)
 
+    def _build_emotion_prompt(self, text: str, *, model: str, style_hint: str = "") -> str:
+        """构造用于 Fish Audio 行内情绪与语气标注的 LLM 提示词。"""
+        emotion_cfg = self.config.emotion
+        is_s1 = (model or "").strip().lower() == "s1"
+        tag_syntax = "圆括号 (标签)" if is_s1 else "方括号 [标签]"
+        presets = str(emotion_cfg.tag_presets or "").strip() or (
+            "开心的语气, 平静, 语气激动, 温柔, 撒娇, 哼歌, 小声说话, 叹气, 轻笑, 疑惑"
+        )
+        example_in = (
+            "嘿嘿，快看这里！如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！"
+            "圆圆滚滚！只有每天准时收看我的视频，才能变成最可爱的企鹅。"
+            "要是错过了，我就要对着你滚滚滚，滚滚开开！嘿咻嘿咻~"
+        )
+        if is_s1:
+            example_out = (
+                "(开心的语气)嘿嘿，快看这里！(平静)如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！"
+                "(语气激动)圆圆滚滚！(平静)只有每天准时收看我的视频，才能变成最可爱的企鹅。"
+                "要是错过了，我就要对着你(语气激动)滚滚滚，滚滚开开！(哼歌)嘿咻嘿咻~"
+            )
+        else:
+            example_out = (
+                "[开心的语气]嘿嘿，快看这里！[平静]如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！"
+                "[语气激动]圆圆滚滚！[平静]只有每天准时收看我的视频，才能变成最可爱的企鹅。"
+                "要是错过了，我就要对着你[语气激动]滚滚滚，滚滚开开！[哼歌]嘿咻嘿咻~"
+            )
+
+        extra_lines: list[str] = []
+        hint = (style_hint or "").strip()
+        if hint:
+            extra_lines.append(f"- 本次整体风格基调参考：{hint}")
+        custom_instr = str(emotion_cfg.custom_instruction or "").strip()
+        if custom_instr:
+            extra_lines.append(f"- 用户自定义配音导演要求：{custom_instr}")
+        extra_block = ("\n" + "\n".join(extra_lines)) if extra_lines else ""
+
+        return (
+            "你是专业配音导演，负责为即将送入 Fish Audio TTS 的台词注入行内情绪与语气控制标签。\n"
+            "请严格遵守以下规则：\n"
+            f"1. 仅使用 {tag_syntax} 格式插入情绪、语气或副语言标签，标签紧贴在对应句首或句中情绪转折词前方。\n"
+            "2. 严禁修改、增删、替换或翻译原始台词中的任何汉字、英文、数字、标点或空白字符。\n"
+            "3. 相邻句子情绪一致时不要重复打标；仅在开场或情绪发生起伏转折时插入新标签。\n"
+            f"4. 常用标签参考（也可结合语境自然描述）：{presets}。{extra_block}\n"
+            "5. 只输出注入标签后的完整文本，不要输出任何解释、引号或 Markdown 代码块。\n\n"
+            f"示例输入：{example_in}\n"
+            f"示例输出：{example_out}\n\n"
+            f"待标注台词：{text}\n"
+            "注入后输出："
+        )
+
+    async def _inject_emotion_tags_via_llm(
+        self,
+        text: str,
+        *,
+        model: str,
+        style_hint: str = "",
+    ) -> Optional[str]:
+        """调用宿主 LLM 能力为台词执行行内情绪注入，并进行原文防篡改校验。"""
+        ctx = self._safe_ctx()
+        llm_cap = getattr(ctx, "llm", None) if ctx is not None else None
+        generate_fn = getattr(llm_cap, "generate", None) if llm_cap is not None else None
+        if not callable(generate_fn):
+            return None
+
+        emotion_cfg = self.config.emotion
+        prompt = self._build_emotion_prompt(text, model=model, style_hint=style_hint)
+        gen_kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "temperature": max(0.0, min(1.0, float(emotion_cfg.temperature))),
+            "max_tokens": max(256, min(2048, len(text) * 2 + 128)),
+        }
+        model_task = str(emotion_cfg.model_task or "").strip()
+        if model_task:
+            gen_kwargs["task_name"] = model_task
+
+        timeout_sec = max(1.0, float(emotion_cfg.timeout_seconds or 8.0))
+        try:
+            result = await asyncio.wait_for(generate_fn(**gen_kwargs), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            self._log.warning("LLM 情绪参数注入超时（%.1fs），将按策略回退", timeout_sec)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("LLM 情绪参数注入调用异常，将按策略回退: %s", exc)
+            return None
+
+        if not isinstance(result, dict) or not result.get("success"):
+            err_msg = str(result.get("error") or "") if isinstance(result, dict) else ""
+            if err_msg:
+                self._log.debug("LLM 情绪参数注入未成功（%s），将按策略回退", err_msg)
+            return None
+
+        response_text = str(result.get("response") or "").strip()
+        if not response_text:
+            return None
+
+        reconciled = reconcile_injected_text(text, response_text, model=model)
+        if reconciled is None:
+            self._log.warning("LLM 情绪注入结果未通过原文一致性校验，已回退")
+            return None
+        return reconciled
+
+    async def inject_emotion_tags(
+        self,
+        text: str,
+        *,
+        model: str = "",
+        style_hint: str = "",
+        force_emotion: bool = False,
+    ) -> str:
+        """按配置（或在 force_emotion=True 时强制）将 Fish Audio 行内情绪标签注入台词。"""
+        raw = (text or "").strip()
+        if not raw or not _SPEAKABLE_CHAR_RE.search(raw):
+            return text
+
+        emotion_cfg = getattr(self.config, "emotion", None)
+        if not force_emotion and (emotion_cfg is None or not emotion_cfg.enabled):
+            return text
+
+        skip_tagged = bool(getattr(emotion_cfg, "skip_if_already_tagged", True)) if emotion_cfg is not None else True
+        if skip_tagged and has_inline_emotion_tags(raw):
+            return text
+
+        target_model = (model or self.config.voice.model or "s2.1-pro-free").strip()
+        mode = str(getattr(emotion_cfg, "mode", "hybrid") or "hybrid").strip().lower()
+
+        if mode in {"llm", "hybrid"}:
+            via_llm = await self._inject_emotion_tags_via_llm(
+                raw,
+                model=target_model,
+                style_hint=style_hint,
+            )
+            if via_llm:
+                self._log.info("情绪参数注入完成 [LLM]: %s", via_llm)
+                return via_llm
+
+        if mode in {"rule", "hybrid"}:
+            via_rule = inject_emotion_tags_by_rules(raw, model=target_model)
+            self._log.info("情绪参数注入完成 [本地规则, mode=%s]: %s", mode, via_rule)
+            return via_rule
+
+        return text
+
+    def _select_voice_display_text(self, item: dict[str, Any], *, force_emotion: bool = False) -> str:
+        """根据配置决定写入语音消息段 data 的文本（展示带情绪标签的转换文本或纯净原文）。"""
+        emotion_cfg = getattr(self.config, "emotion", None)
+        if emotion_cfg is not None and (emotion_cfg.enabled or force_emotion) and emotion_cfg.show_injected_text:
+            injected = str(item.get("injected_text") or "").strip()
+            if injected:
+                return injected
+        return str(item.get("text") or "")
+
+    def _should_send_injected_preview_to_chat(self, *, force_emotion: bool = False) -> bool:
+        emotion_cfg = getattr(self.config, "emotion", None)
+        return bool(
+            emotion_cfg is not None
+            and (emotion_cfg.enabled or force_emotion)
+            and emotion_cfg.send_injected_text_to_chat
+        )
+
+    @staticmethod
+    def _collect_injected_preview_text(items: Sequence[dict[str, Any]]) -> str:
+        parts = [str(item.get("injected_text") or item.get("text") or "").strip() for item in items]
+        return "\n".join(part for part in parts if part).strip()
+
+    async def _maybe_send_injected_preview_to_chat(
+        self,
+        items: Sequence[dict[str, Any]],
+        stream_id: str,
+        *,
+        force_emotion: bool = False,
+    ) -> None:
+        """当开启聊天窗口同步预览时，发出带 [情绪标签] 的实际转换文本且屏蔽自动语音环回。"""
+        if not stream_id or not items or not self._should_send_injected_preview_to_chat(force_emotion=force_emotion):
+            return
+        preview_text = self._collect_injected_preview_text(items)
+        if not preview_text:
+            return
+        self._register_fallback_bypass(stream_id, preview_text)
+        try:
+            await self.ctx.send.text(preview_text, stream_id)
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("发送情绪注入文本预览失败 (stream=%s): %s", stream_id, exc)
+
+    async def _prepare_emotion_segments(
+        self,
+        segments: Sequence[str],
+        *,
+        model: str = "",
+        style_hint: str = "",
+        force_emotion: bool = False,
+    ) -> list[str]:
+        """为多段待合成文本执行全局情绪标注并精确映射回各分段。"""
+        seg_list = [str(s) for s in segments]
+        if not seg_list:
+            return []
+
+        emotion_cfg = getattr(self.config, "emotion", None)
+        if not force_emotion and (emotion_cfg is None or not emotion_cfg.enabled):
+            return seg_list
+
+        target_model = (model or self.config.voice.model or "s2.1-pro-free").strip()
+        if len(seg_list) == 1:
+            return [
+                await self.inject_emotion_tags(
+                    seg_list[0],
+                    model=target_model,
+                    style_hint=style_hint,
+                    force_emotion=force_emotion,
+                )
+            ]
+
+        skip_tagged = bool(getattr(emotion_cfg, "skip_if_already_tagged", True)) if emotion_cfg is not None else True
+        if skip_tagged and any(has_inline_emotion_tags(s) for s in seg_list):
+            return seg_list
+
+        joined = "\n".join(seg_list)
+        annotated = await self.inject_emotion_tags(
+            joined,
+            model=target_model,
+            style_hint=style_hint,
+            force_emotion=force_emotion,
+        )
+        if annotated == joined:
+            return seg_list
+        return map_annotated_to_segments(seg_list, annotated, model=target_model)
+
     async def _synthesize_pipeline(
         self,
         text: str,
@@ -1576,6 +2322,8 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         speed: Optional[float] = None,
         wrap_pcm: bool = True,
         defer_immediate_cleanup: bool = False,
+        injected_text: Optional[str] = None,
+        force_emotion: bool = False,
     ) -> dict[str, Any]:
         """共享合成主链路：服务调用、音频后处理、可选存储与结构化返回。"""
         if not self._is_enabled():
@@ -1593,7 +2341,26 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             return {"success": False, "error": "合成文本为空", "busy": False}
 
         options = self._build_synthesis_options(audio_format=audio_format, speed=speed)
-        styled_text = apply_style_instruction(raw_text, style, options.model)
+        if isinstance(injected_text, str) and injected_text.strip():
+            prepared_text = injected_text.strip()
+        else:
+            prepared_text = await self.inject_emotion_tags(
+                raw_text,
+                model=options.model,
+                style_hint=style,
+                force_emotion=force_emotion,
+            )
+
+        is_s1 = (options.model or "").strip().lower() == "s1"
+        has_injected_head_tag = (
+            prepared_text != raw_text
+            and prepared_text.startswith("(" if is_s1 else "[")
+        )
+        if style and not has_injected_head_tag:
+            styled_text = apply_style_instruction(prepared_text, style, options.model)
+        else:
+            styled_text = prepared_text
+
         voice_label, ref_id, ref_samples = self._resolve_voice_target(voice)
 
         if self.config.fallback.skip_when_busy and self._semaphore.locked():
@@ -1641,6 +2408,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             "model": options.model,
             "voice": voice_label,
             "text": raw_text,
+            "injected_text": styled_text,
         }
         if saved_path is not None:
             payload["audio_path"] = str(saved_path)
@@ -1839,17 +2607,39 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         voice: str = "",
         style: str = "",
         total_budget_sec: Optional[float] = None,
+        force_emotion: bool = False,
     ) -> tuple[list[dict[str, Any]], Optional[int], str]:
         """按顺序合成多个文本分片，受可选总预算约束，返回 (已成功列表, 首个失败索引, 失败原因)。"""
         synthesized: list[dict[str, Any]] = []
         deadline = time.monotonic() + total_budget_sec if total_budget_sec else None
+        target_model = str(getattr(getattr(self.config, "voice", None), "model", "") or "s2.1-pro-free")
+
+        prepared_segments = list(segments)
+        try:
+            prep_coro = self._prepare_emotion_segments(
+                segments,
+                model=target_model,
+                style_hint=style,
+                force_emotion=force_emotion,
+            )
+            if deadline is not None:
+                prep_budget = max(0.1, deadline - time.monotonic())
+                prepared_segments = await asyncio.wait_for(prep_coro, timeout=prep_budget)
+            else:
+                prepared_segments = await prep_coro
+        except Exception:  # noqa: BLE001
+            prepared_segments = list(segments)
+
         for idx, seg_text in enumerate(segments):
+            injected_seg = prepared_segments[idx] if idx < len(prepared_segments) else seg_text
             coro = self._synthesize_pipeline(
                 seg_text,
                 voice=voice,
                 style=style,
                 wrap_pcm=True,
                 defer_immediate_cleanup=True,
+                injected_text=injected_seg,
+                force_emotion=force_emotion,
             )
             try:
                 if deadline is not None:
@@ -2100,7 +2890,7 @@ class FishAudioVoicePlugin(MaiBotPlugin):
                                 "segments": [
                                     {
                                         "type": "voice",
-                                        "data": str(item["text"]),
+                                        "data": self._select_voice_display_text(item),
                                         "binary_data_base64": str(item["audio_base64"]),
                                     }
                                 ],
@@ -2120,6 +2910,16 @@ class FishAudioVoicePlugin(MaiBotPlugin):
 
             if not out_messages:
                 raise RuntimeError(synth_err or "Fish Audio 语音合成失败")
+
+            if self._should_send_injected_preview_to_chat():
+                preview_text = self._collect_injected_preview_text(synthesized)
+                if preview_text:
+                    out_messages.append(
+                        {
+                            "segments": [{"type": "text", "data": preview_text}],
+                            "quote_previous": False,
+                        }
+                    )
 
             last_item = synthesized[-1]
             self._log.info(
@@ -2269,11 +3069,12 @@ class FishAudioVoicePlugin(MaiBotPlugin):
                 last_item["model"],
                 last_item["voice"],
             )
+            await self._maybe_send_injected_preview_to_chat(synthesized, stream_id)
             return _build_voice_hook_result(
                 kwargs,
                 message,
                 str(last_item["audio_base64"]),
-                str(last_item["text"]),
+                self._select_voice_display_text(last_item),
             )
         except Exception as exc:  # noqa: BLE001
             self._log.warning("出站语音链路异常中断: %s", exc)
@@ -2285,6 +3086,160 @@ class FishAudioVoicePlugin(MaiBotPlugin):
                     "\n".join(segments[sent_head:]),
                 )
             return None
+
+    async def _deliver_voice_reply(
+        self,
+        raw_text: str,
+        *,
+        stream_id: str,
+        voice: str = "",
+        style: str = "",
+        force_emotion: bool = False,
+    ) -> dict[str, Any]:
+        """执行文本分段、情绪注入、语音合成、发送及失败降级公共流程。"""
+        av = getattr(self.config, "auto_voice", None)
+        should_split = bool(av and av.split_sentences) and len(raw_text) > int(av.max_segment_chars)
+        segments = (
+            split_tts_segments(
+                raw_text,
+                max_chars=int(av.max_segment_chars),
+                split_sentences=True,
+            )
+            if should_split
+            else [raw_text]
+        ) or [raw_text]
+
+        delay_ms = int(av.segment_delay_ms) if av is not None else 0
+        synthesized, failed_from, synth_err = await self._synthesize_segments(
+            segments,
+            voice=voice,
+            style=style,
+            force_emotion=force_emotion,
+        )
+        if failed_from is not None:
+            sent_count = 0
+            if synthesized:
+                sent_count, _ = await self._send_segment_sequence(
+                    synthesized,
+                    stream_id,
+                    delay_ms=delay_ms,
+                )
+            remaining = "\n".join(segments[sent_count:])
+            fb_res = await self._fallback_to_text(remaining, stream_id, reason=synth_err)
+            return {
+                "success": False,
+                "status": "fallback_text" if fb_res.get("fallback_sent") else "failed",
+                "error": synth_err,
+                "fallback_sent": fb_res.get("fallback_sent", False),
+                "partial_voice_segments": sent_count,
+            }
+
+        sent_count, send_err = await self._send_segment_sequence(
+            synthesized,
+            stream_id,
+            delay_ms=delay_ms,
+        )
+        if send_err:
+            remaining = "\n".join(segments[sent_count:])
+            fb_res = await self._fallback_to_text(remaining, stream_id, reason=f"发送语音失败: {send_err}")
+            return {
+                "success": False,
+                "status": "fallback_text" if fb_res.get("fallback_sent") else "failed",
+                "error": send_err,
+                "fallback_sent": fb_res.get("fallback_sent", False),
+                "partial_voice_segments": sent_count,
+            }
+
+        total_bytes = sum(int(item["audio_bytes_len"]) for item in synthesized)
+        last_item = synthesized[-1]
+        await self._maybe_send_injected_preview_to_chat(
+            synthesized,
+            stream_id,
+            force_emotion=force_emotion,
+        )
+        self._log.info(
+            "语音回复发送成功 (stream=%s, segments=%d, model=%s, voice=%s, bytes=%d, fmt=%s, force_emotion=%s)",
+            stream_id,
+            len(synthesized),
+            last_item["model"],
+            last_item["voice"],
+            total_bytes,
+            last_item["format"],
+            force_emotion,
+        )
+        return {
+            "success": True,
+            "status": "sent",
+            "content": "语音已合成并发送给对方，无需再用 reply 发送重复文字。",
+            "stream_id": stream_id,
+            "segments": len(synthesized),
+            "model": last_item["model"],
+            "voice": last_item["voice"],
+            "format": last_item["format"],
+            "audio_bytes_len": total_bytes,
+        }
+
+    @staticmethod
+    def _parse_fishaudio_command_args(kwargs: dict[str, Any]) -> tuple[str, bool]:
+        """解析 /fishaudio 命令参数，返回 (待合成文本, 是否使用 emo 强制注入情绪)。"""
+        raw_arg = ""
+        matched = kwargs.get("matched_groups")
+        if isinstance(matched, dict):
+            raw_arg = str(matched.get("text") or "").strip()
+        if not raw_arg:
+            raw_msg = str(kwargs.get("text") or "").strip()
+            cmd_match = re.match(r"(?is)^/fishaudio(?:\s+(?P<text>.+))?\s*$", raw_msg)
+            if cmd_match:
+                raw_arg = str(cmd_match.group("text") or "").strip()
+        if not raw_arg:
+            return "", False
+
+        if raw_arg.lower() == "emo":
+            return "", True
+        emo_match = re.match(r"^emo\s+(?P<body>.+)$", raw_arg, re.IGNORECASE | re.DOTALL)
+        if emo_match:
+            return str(emo_match.group("body") or "").strip(), True
+        return raw_arg, False
+
+    @Command(
+        "fishaudio",
+        description="强制将后续文本转换为 Fish Audio 语音；使用 /fishaudio emo <文本> 可强制注入情绪标签",
+        pattern=r"(?is)^/fishaudio(?:\s+(?P<text>.+))?\s*$",
+        timeout_ms=120000,
+    )
+    async def handle_fishaudio_command(self, **kwargs: Any) -> tuple[bool, str, bool]:
+        """处理 /fishaudio [emo] <文本> 命令，强制转换为语音并拦截后续默认回复。"""
+        stream_id = await self._find_stream_id(kwargs)
+        if not self._is_enabled():
+            if stream_id:
+                disabled_tip = "Fish Audio 语音插件当前已禁用，请在配置中开启。"
+                self._register_fallback_bypass(stream_id, disabled_tip)
+                await self.ctx.send.text(disabled_tip, stream_id)
+            return False, "Fish Audio 语音插件当前已禁用", True
+
+        target_text, force_emotion = self._parse_fishaudio_command_args(kwargs)
+        if not target_text:
+            if stream_id:
+                usage_tip = (
+                    "用法：/fishaudio <要转换为语音的文本>\n"
+                    "强制注入情绪标签：/fishaudio emo <要转换为语音的文本>"
+                )
+                self._register_fallback_bypass(stream_id, usage_tip)
+                await self.ctx.send.text(usage_tip, stream_id)
+            return False, "缺少待转换的文本内容", True
+
+        if not stream_id:
+            self._log.warning("/fishaudio 命令未找到目标 stream_id，放弃语音合成以避免跨群错发")
+            return False, "无法定位当前聊天流 stream_id", True
+
+        res = await self._deliver_voice_reply(
+            target_text,
+            stream_id=stream_id,
+            force_emotion=force_emotion,
+        )
+        if res.get("success"):
+            return True, f"已发送语音（共 {int(res.get('segments') or 1)} 段）", True
+        return False, str(res.get("error") or "语音转换失败"), True
 
     @Tool(
         "send_voice_reply",
@@ -2323,6 +3278,8 @@ class FishAudioVoicePlugin(MaiBotPlugin):
         text: str,
         voice: str = "",
         style: str = "",
+        *,
+        force_emotion: bool = False,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """合成语音并发送至当前聊天流，支持自动分段，失败时按配置自动退回纯文字。"""
@@ -2339,80 +3296,13 @@ class FishAudioVoicePlugin(MaiBotPlugin):
             self._log.warning("send_voice_reply 未找到目标 stream_id，放弃语音合成以避免跨群错发")
             return {"success": False, "status": "no_stream", "error": "无法定位当前聊天流 stream_id"}
 
-        av = getattr(self.config, "auto_voice", None)
-        should_split = bool(av and av.split_sentences) and len(raw_text) > int(av.max_segment_chars)
-        segments = (
-            split_tts_segments(
-                raw_text,
-                max_chars=int(av.max_segment_chars),
-                split_sentences=True,
-            )
-            if should_split
-            else [raw_text]
-        ) or [raw_text]
-
-        delay_ms = int(av.segment_delay_ms) if av is not None else 0
-        synthesized, failed_from, synth_err = await self._synthesize_segments(
-            segments,
+        return await self._deliver_voice_reply(
+            raw_text,
+            stream_id=stream_id,
             voice=voice,
             style=style,
+            force_emotion=force_emotion,
         )
-        if failed_from is not None:
-            sent_count = 0
-            if synthesized:
-                sent_count, _ = await self._send_segment_sequence(
-                    synthesized,
-                    stream_id,
-                    delay_ms=delay_ms,
-                )
-            remaining = "\n".join(segments[sent_count:])
-            fb_res = await self._fallback_to_text(remaining, stream_id, reason=synth_err)
-            return {
-                "success": False,
-                "status": "fallback_text" if fb_res.get("fallback_sent") else "failed",
-                "error": synth_err,
-                "fallback_sent": fb_res.get("fallback_sent", False),
-                "partial_voice_segments": sent_count,
-            }
-
-        sent_count, send_err = await self._send_segment_sequence(
-            synthesized,
-            stream_id,
-            delay_ms=delay_ms,
-        )
-        if send_err:
-            remaining = "\n".join(segments[sent_count:])
-            fb_res = await self._fallback_to_text(remaining, stream_id, reason=f"发送语音失败: {send_err}")
-            return {
-                "success": False,
-                "status": "fallback_text" if fb_res.get("fallback_sent") else "failed",
-                "error": send_err,
-                "fallback_sent": fb_res.get("fallback_sent", False),
-                "partial_voice_segments": sent_count,
-            }
-
-        total_bytes = sum(int(item["audio_bytes_len"]) for item in synthesized)
-        last_item = synthesized[-1]
-        self._log.info(
-            "语音回复发送成功 (stream=%s, segments=%d, model=%s, voice=%s, bytes=%d, fmt=%s)",
-            stream_id,
-            len(synthesized),
-            last_item["model"],
-            last_item["voice"],
-            total_bytes,
-            last_item["format"],
-        )
-        return {
-            "success": True,
-            "status": "sent",
-            "content": "语音已合成并发送给对方，无需再用 reply 发送重复文字。",
-            "stream_id": stream_id,
-            "segments": len(synthesized),
-            "model": last_item["model"],
-            "voice": last_item["voice"],
-            "format": last_item["format"],
-            "audio_bytes_len": total_bytes,
-        }
 
     @API(
         "fish_tts",

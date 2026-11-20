@@ -3,7 +3,7 @@
 
 [plugin]
 enabled = true
-config_version = "1.1.0"
+config_version = "1.2.0"
 
 [voice]
 # Fish Audio API Key（Bearer Token），请在 https://fish.audio 控制台获取
@@ -57,6 +57,31 @@ min_text_length = 1
 max_text_length = 500
 # 消息包含 http(s) 网址或代码块时保持纯文本不转语音
 skip_urls_and_code = true
+
+[emotion]
+# 是否在语音合成前自动分析台词并注入行内情绪与语气标签（如 [开心的语气]、[平静]、[语气激动]、[哼歌]）
+enabled = true
+# 情绪注入模式：
+# - hybrid：优先调用宿主大模型进行细腻语义标注，超时或失败时自动回退到本地启发式规则（推荐默认）
+# - llm：仅使用宿主大模型进行智能标注，失败时保留原台词
+# - rule：纯本地启发式规则零延迟注入，不消耗大模型 Token
+mode = "hybrid"
+# 调用宿主 ctx.llm.generate 时指定的模型任务名或具体模型名（留空使用宿主默认任务；也可填 utils、replyer 等）
+model_task = ""
+# 情绪标注大模型的采样温度（0.0 - 1.0）
+temperature = 0.3
+# 单次 LLM 情绪标注最大等待超时时间（秒）
+timeout_seconds = 8.0
+# 推荐的情绪、语气与副语言标签参考库（逗号分隔；Fish Audio S2 系列同时支持开放式自然语言标签）
+tag_presets = "开心的语气, 平静, 语气激动, 温柔, 撒娇, 哼歌, 小声说话, 叹气, 轻笑, 疑惑, 委屈, 严肃, 俏皮, 惊讶"
+# 可选的额外配音导演指令（例如限定角色语气基调，留空按通用规则注入）
+custom_instruction = ""
+# 若待合成文本已包含 [标签] 或 (标签) 情绪标记，则跳过自动注入
+skip_if_already_tagged = true
+# 是否在语音消息元信息、WebUI 观察面板及控制台出站日志中显示带 [情绪标签] 的实际转换文本（失败降级文字时仍会自动剥离标签）
+show_injected_text = true
+# 是否在发送语音时同步在聊天窗口发一条带 [情绪标签] 的实际转换文本预览（便于在 QQ/微信边听语音边核对标签）
+send_injected_text_to_chat = false
 
 [storage]
 # 是否保存每次生成的输出语音文件到本地；默认 false（仅内存经 Base64 传输，不在磁盘留存历史音频；

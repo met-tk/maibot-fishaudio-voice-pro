@@ -9,8 +9,8 @@
       "fallback": "volume-2"
     }
   },
-  "version": "1.1.1",
-  "description": "Fish Audio TTS 与音色克隆 MaiBot 插件，适配 /v1/tts (s2.1-pro-free / s2.1-pro / s2-pro / drama-3)，支持 Planner 自主决策语音回复、独立温度/概率滑块、云端 reference_id 与本地 voices/ MessagePack 即时复刻、三段式超时控制、退避重试、失败自动退回文字与 ffmpeg 本地调音",
+  "version": "1.2.0",
+  "description": "Fish Audio TTS 与音色克隆 MaiBot 插件，适配 /v1/tts (s2.1-pro-free / s2.1-pro / s2-pro / drama-3)，支持行内情绪与语气标签自动注入（LLM + 规则混合与原文防篡改校验）、/fishaudio [emo] 强制语音命令、Planner 自主决策语音回复、独立温度/概率滑块、云端 reference_id 与本地 voices/ MessagePack 即时复刻、三段式超时控制、退避重试、失败自动退回文字与 ffmpeg 本地调音",
   "author": {
     "name": "met-tk",
     "url": "https://github.com/met-tk"
@@ -36,7 +36,8 @@
     "send.text",
     "send.custom",
     "message.get_by_id",
-    "chat.get_all_streams"
+    "chat.get_all_streams",
+    "llm.generate"
   ],
   "i18n": {
     "default_locale": "zh-CN",

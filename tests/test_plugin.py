@@ -66,6 +66,11 @@ FishAudioPluginConfig = plugin_mod.FishAudioPluginConfig
 FishAudioVoicePlugin = plugin_mod.FishAudioVoicePlugin
 apply_style_instruction = plugin_mod.apply_style_instruction
 create_plugin = plugin_mod.create_plugin
+format_emotion_tag = plugin_mod.format_emotion_tag
+has_inline_emotion_tags = plugin_mod.has_inline_emotion_tags
+inject_emotion_tags_by_rules = plugin_mod.inject_emotion_tags_by_rules
+map_annotated_to_segments = plugin_mod.map_annotated_to_segments
+reconcile_injected_text = plugin_mod.reconcile_injected_text
 split_tts_segments = plugin_mod.split_tts_segments
 strip_audio_tags = plugin_mod.strip_audio_tags
 _extract_outbound_plain_text = plugin_mod._extract_outbound_plain_text  # noqa: SLF001
@@ -93,16 +98,17 @@ class _FakeResponse:
         return None
 
 
-def _make_dummy_ctx(streams: list[Any] | None = None) -> SimpleNamespace:
+def _make_dummy_ctx(streams: list[Any] | None = None, llm: Any = None) -> SimpleNamespace:
     send = SimpleNamespace(
         text=AsyncMock(return_value=SimpleNamespace(success=True, error="")),
         custom=AsyncMock(return_value=SimpleNamespace(success=True, error="")),
     )
     message = SimpleNamespace(get_by_id=AsyncMock(return_value=None))
     chat = SimpleNamespace(get_all_streams=AsyncMock(return_value=streams or []))
+    llm_cap = llm or SimpleNamespace(generate=AsyncMock(return_value={"success": False, "response": ""}))
     paths = SimpleNamespace(data_dir=PLUGIN_DIR, runtime_dir=PLUGIN_DIR)
     logger = logging.getLogger("fishaudio.test")
-    return SimpleNamespace(send=send, message=message, chat=chat, paths=paths, logger=logger)
+    return SimpleNamespace(send=send, message=message, chat=chat, llm=llm_cap, paths=paths, logger=logger)
 
 
 class ConfigAndEndpointTests(unittest.TestCase):
@@ -111,7 +117,7 @@ class ConfigAndEndpointTests(unittest.TestCase):
     def test_default_config_matches_spec(self) -> None:
         cfg = FishAudioPluginConfig()
         self.assertTrue(cfg.plugin.enabled)
-        self.assertEqual(cfg.plugin.config_version, "1.1.0")
+        self.assertEqual(cfg.plugin.config_version, "1.2.0")
         self.assertEqual(cfg.voice.model, "s2.1-pro-free")
         self.assertEqual(cfg.voice.api_base_url, "https://api.fish.audio/v1/tts")
         self.assertEqual(cfg.voice.voice_mode, "auto")
@@ -121,6 +127,11 @@ class ConfigAndEndpointTests(unittest.TestCase):
         self.assertAlmostEqual(cfg.auto_voice.planner_temperature, 0.5)
         self.assertAlmostEqual(cfg.auto_voice.random_probability, 0.5)
         self.assertAlmostEqual(cfg.auto_voice.decision_ttl_seconds, 8.0)
+        self.assertTrue(cfg.emotion.enabled)
+        self.assertEqual(cfg.emotion.mode, "hybrid")
+        self.assertTrue(cfg.emotion.skip_if_already_tagged)
+        self.assertTrue(cfg.emotion.show_injected_text)
+        self.assertFalse(cfg.emotion.send_injected_text_to_chat)
         self.assertEqual(cfg.generation.chunk_length, 300)
         self.assertEqual(cfg.generation.prosody_speed, 1.0)
         self.assertTrue(cfg.fallback.fallback_to_text)
@@ -156,6 +167,11 @@ class ConfigAndEndpointTests(unittest.TestCase):
             self.assertEqual(field_schema["max"], 1.0)
             self.assertEqual(field_schema["step"], 0.05)
 
+        emo_fields = schema["sections"]["emotion"]["fields"]
+        self.assertTrue(emo_fields["enabled"]["default"])
+        self.assertEqual(emo_fields["mode"]["choices"], ["hybrid", "llm", "rule"])
+        self.assertEqual(emo_fields["temperature"]["ui_type"], "slider")
+
         # 旧版 1.0.0 enabled=true/false 迁移
         migrated_on, changed_on = plugin.normalize_plugin_config(
             {"plugin": {"config_version": "1.0.0", "enabled": True}, "auto_voice": {"enabled": True}}
@@ -170,8 +186,10 @@ class ConfigAndEndpointTests(unittest.TestCase):
         self.assertTrue(changed_off)
         self.assertEqual(migrated_off["auto_voice"]["mode"], "off")
 
-        # 显式校验组件收集（ReplyExtension 与可见 Tool）
+        # 显式校验组件收集（ReplyExtension、Command 与可见 Tool）
         components = {c["name"]: c for c in plugin.get_components()}
+        self.assertIn("fishaudio", components)
+        self.assertEqual(components["fishaudio"]["type"], "COMMAND")
         self.assertIn("voice_reply", components)
         self.assertEqual(components["voice_reply"]["type"], "REPLY_EXTENSION")
         self.assertEqual(components["fish_planner_voice_policy"]["type"], "HOOK_HANDLER")
@@ -620,7 +638,10 @@ class AutoVoiceAndStorageTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_auto_voice_hook_single_and_multi_segment(self) -> None:
-        plugin = self._build_plugin(auto_voice={"mode": "always", "segment_delay_ms": 0, "max_segment_chars": 80})
+        plugin = self._build_plugin(
+            auto_voice={"mode": "always", "segment_delay_ms": 0, "max_segment_chars": 80},
+            emotion={"enabled": False},
+        )
 
         async def fake_synth(text: str, **kwargs: Any) -> dict[str, Any]:
             raw = f"AUDIO:{text}".encode("utf-8")
@@ -984,10 +1005,10 @@ class PlannerAndProbabilityModeTests(unittest.IsolatedAsyncioTestCase):
         out_msgs = res_explicit["messages"]
         self.assertEqual(len(out_msgs), 3)
         self.assertEqual(out_msgs[0]["segments"][0]["type"], "voice")
-        self.assertEqual(out_msgs[0]["segments"][0]["data"], "[laughing] 早安呀。")
+        self.assertEqual(out_msgs[0]["segments"][0]["data"], "[gentle] [laughing] 早安呀。")
         self.assertFalse(out_msgs[0]["quote_previous"])
         self.assertEqual(out_msgs[1]["segments"][0]["type"], "voice")
-        self.assertEqual(out_msgs[1]["segments"][0]["data"], "今天开心吗？")
+        self.assertEqual(out_msgs[1]["segments"][0]["data"], "[gentle] 今天开心吗？")
         # 表情附件消息必须原样保留
         self.assertEqual(out_msgs[2]["segments"][0]["type"], "emoji")
 
@@ -1340,6 +1361,348 @@ class PlannerAndProbabilityModeTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(res_url["messages"][0]["segments"][0]["data"], "看这里 https://example.com")
         self.assertTrue(any("包含跳过模式" in msg for msg in captured.output))
+
+
+class EmotionInjectionTests(unittest.IsolatedAsyncioTestCase):
+    """Fish Audio 行内情绪与语气参数自动注入单元测试。"""
+
+    SAMPLE_PENGUIN_TEXT = (
+        "嘿嘿，快看这里！如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！"
+        "圆圆滚滚！只有每天准时收看我的视频，才能变成最可爱的企鹅。"
+        "要是错过了，我就要对着你滚滚滚，滚滚开开！嘿咻嘿咻~"
+    )
+    EXPECTED_PENGUIN_ANNOTATED = (
+        "[开心的语气]嘿嘿，快看这里！[平静]如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！"
+        "[语气激动]圆圆滚滚！[平静]只有每天准时收看我的视频，才能变成最可爱的企鹅。"
+        "要是错过了，我就要对着你[语气激动]滚滚滚，滚滚开开！[哼歌]嘿咻嘿咻~"
+    )
+
+    def _build_plugin(self, **overrides: Any) -> FishAudioVoicePlugin:
+        plugin = create_plugin()
+        cfg = FishAudioPluginConfig()
+        cfg.voice.fish_api_key = "sk-test-token"
+        for section_name, fields in overrides.items():
+            section = getattr(cfg, section_name)
+            for k, v in fields.items():
+                setattr(section, k, v)
+        plugin._plugin_config_instance = cfg
+        plugin._set_context(_make_dummy_ctx(streams=[]))
+        plugin._rebuild_runtime()  # noqa: SLF001
+        return plugin
+
+    def test_penguin_example_rule_injection_and_zero_tampering(self) -> None:
+        injected = inject_emotion_tags_by_rules(self.SAMPLE_PENGUIN_TEXT, model="s2.1-pro-free")
+        self.assertEqual(injected, self.EXPECTED_PENGUIN_ANNOTATED)
+        self.assertEqual(strip_audio_tags(injected), self.SAMPLE_PENGUIN_TEXT)
+
+        # s1 模型自动切换为圆括号标签语法
+        self.assertEqual(format_emotion_tag("开心的语气", model="s1"), "(开心的语气)")
+        injected_s1 = inject_emotion_tags_by_rules("嘿嘿，早安！", model="s1")
+        self.assertEqual(injected_s1, "(开心的语气)嘿嘿，早安！")
+
+    def test_reconcile_injected_text_guards_against_llm_tampering(self) -> None:
+        # 1. 带代码块围栏、引导前缀与标签后多余空格时清洗还原原文
+        noisy_cand = (
+            "```text\n"
+            "注入后：[开心的语气] 嘿嘿，快看这里！[平静] 如果你现在还没关注臭企鹅。\n"
+            "```"
+        )
+        orig = "嘿嘿，快看这里！如果你现在还没关注臭企鹅。"
+        reconciled = reconcile_injected_text(orig, noisy_cand, model="s2.1-pro-free")
+        self.assertEqual(reconciled, "[开心的语气]嘿嘿，快看这里！[平静]如果你现在还没关注臭企鹅。")
+
+        # 2. LLM 漏字/改字时自动对齐还原原始字词并保留正确位置标签
+        tampered_cand = "[平静]要是错过了，我就对着你[语气激动]滚滚滚！"
+        orig2 = "要是错过了，我就要对着你滚滚滚！"
+        reconciled2 = reconcile_injected_text(orig2, tampered_cand, model="s2.1-pro-free")
+        self.assertEqual(reconciled2, "[平静]要是错过了，我就要对着你[语气激动]滚滚滚！")
+        self.assertEqual(strip_audio_tags(reconciled2 or ""), orig2)
+
+        # 3. 无关幻觉或无标签时返回 None
+        self.assertIsNone(reconcile_injected_text(orig2, "[开心]完全不相关的一段新台词", model="s2.1-pro-free"))
+        self.assertIsNone(reconcile_injected_text(orig2, orig2, model="s2.1-pro-free"))
+
+    async def test_emotion_modes_timeout_fallback_and_skip_tagged(self) -> None:
+        # 1. hybrid 模式：LLM 成功时直接采用 LLM 结果，并透传 task_name
+        plugin = self._build_plugin(
+            emotion={"enabled": True, "mode": "hybrid", "model_task": "utils", "timeout_seconds": 2.0}
+        )
+        plugin.ctx.llm.generate = AsyncMock(
+            return_value={"success": True, "response": "[温柔]晚安呀，[轻笑]记得盖好被子。"}
+        )
+        res_llm = await plugin.inject_emotion_tags("晚安呀，记得盖好被子。")
+        self.assertEqual(res_llm, "[温柔]晚安呀，[轻笑]记得盖好被子。")
+        self.assertEqual(plugin.ctx.llm.generate.await_args.kwargs.get("task_name"), "utils")
+
+        # 2. 已包含行内标签时跳过重复注入
+        self.assertTrue(has_inline_emotion_tags("[laughing] 早安"))
+        plugin.ctx.llm.generate.reset_mock()
+        self.assertEqual(await plugin.inject_emotion_tags("[laughing] 早安"), "[laughing] 早安")
+        plugin.ctx.llm.generate.assert_not_awaited()
+
+        # 3. hybrid 模式：LLM 超时后无感回退本地规则注入
+        plugin.ctx.llm.generate = AsyncMock(side_effect=asyncio.TimeoutError())
+        fallback_rule = await plugin.inject_emotion_tags(self.SAMPLE_PENGUIN_TEXT)
+        self.assertEqual(fallback_rule, self.EXPECTED_PENGUIN_ANNOTATED)
+
+        # 4. llm 模式：LLM 失败时保留原文
+        plugin.config.emotion.mode = "llm"
+        plugin.ctx.llm.generate = AsyncMock(return_value={"success": False, "error": "no model"})
+        self.assertEqual(await plugin.inject_emotion_tags("嘿嘿，你好！"), "嘿嘿，你好！")
+
+        # 5. rule 模式：绝不调用 LLM
+        plugin.config.emotion.mode = "rule"
+        plugin.ctx.llm.generate = AsyncMock()
+        self.assertEqual(await plugin.inject_emotion_tags("嘿嘿，你好！"), "[开心的语气]嘿嘿，你好！")
+        plugin.ctx.llm.generate.assert_not_awaited()
+
+        # 6. 关闭开关时完全透传原文
+        plugin.config.emotion.enabled = False
+        self.assertEqual(await plugin.inject_emotion_tags(self.SAMPLE_PENGUIN_TEXT), self.SAMPLE_PENGUIN_TEXT)
+
+    async def test_multi_segment_global_injection_and_clean_history_isolation(self) -> None:
+        plugin = self._build_plugin(
+            auto_voice={"mode": "always", "max_segment_chars": 70, "segment_delay_ms": 0},
+            emotion={"enabled": True, "mode": "hybrid"},
+        )
+        plugin.ctx.llm.generate = AsyncMock(
+            return_value={
+                "success": True,
+                "response": (
+                    "[开心的语气]嘿嘿，快看这里！\n"
+                    "[平静]如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！\n"
+                    "[语气激动]圆圆滚滚！\n"
+                    "[平静]只有每天准时收看我的视频，才能变成最可爱的企鹅。\n"
+                    "要是错过了，我就要对着你[语气激动]滚滚滚，滚滚开开！\n"
+                    "[哼歌]嘿咻嘿咻~"
+                ),
+            }
+        )
+
+        sent_texts: list[str] = []
+
+        async def capture_synth(text: str, **kwargs: Any) -> dict[str, Any]:
+            sent_texts.append(text)
+            raw = f"AUDIO:{text}".encode("utf-8")
+            return {
+                "success": True,
+                "audio_base64": base64.b64encode(raw).decode("ascii"),
+                "audio_bytes_len": len(raw),
+                "text": text,
+            }
+
+        plugin._tts_service.synthesize = AsyncMock(side_effect=capture_synth)  # noqa: SLF001
+
+        msg = {
+            "session_id": "group_penguin",
+            "raw_message": [{"type": "text", "data": self.SAMPLE_PENGUIN_TEXT}],
+        }
+        res = await plugin.auto_voice_hook(message=msg, set_reply=False)
+        assert res is not None
+
+        # 多段合成只调 1 次 LLM 全局标注
+        plugin.ctx.llm.generate.assert_awaited_once()
+        self.assertGreaterEqual(len(sent_texts), 2)
+        joined_sent = "".join(sent_texts)
+        self.assertIn("[开心的语气]", joined_sent)
+        self.assertIn("[平静]", joined_sent)
+        self.assertIn("[语气激动]", joined_sent)
+        self.assertIn("[哼歌]", joined_sent)
+        # 相邻接续分段若原句首无标签（如“要是错过了...”独立成段时）应自动继承前一段活跃情绪 [平静]
+        self.assertTrue(all(t.startswith("[") for t in sent_texts))
+
+        # 关闭展示开关时 voice.data 仅保留原文；默认开启时 voice.data 直接展示带标签的转换文本
+        final_voice_seg = res["modified_kwargs"]["message"]["raw_message"][0]
+        self.assertEqual(final_voice_seg["type"], "voice")
+        self.assertIn("[哼歌]", final_voice_seg["data"])
+        self.assertIn("嘿咻嘿咻~", final_voice_seg["data"])
+
+        # 关闭 show_injected_text 后，写回消息段的 data 保持干净原文，不含情绪标签
+        plugin.config.emotion.show_injected_text = False
+        plugin.ctx.llm.generate.reset_mock()
+        res_clean = await plugin.auto_voice_hook(message=msg, set_reply=False)
+        assert res_clean is not None
+        clean_voice_seg = res_clean["modified_kwargs"]["message"]["raw_message"][0]
+        self.assertNotIn("[", clean_voice_seg["data"])
+        self.assertIn("嘿咻嘿咻~", clean_voice_seg["data"])
+
+        # api_synthesize 单句直调也默认注入标签并返回 injected_text，同时保持 text 为原文
+        plugin.config.emotion.mode = "rule"
+        api_res = await plugin.api_synthesize("嘿嘿，快看这里！")
+        self.assertTrue(api_res["success"])
+        self.assertEqual(api_res["text"], "嘿嘿，快看这里！")
+        self.assertEqual(api_res["injected_text"], "[开心的语气]嘿嘿，快看这里！")
+
+    async def test_info_logging_and_send_injected_text_to_chat_preview(self) -> None:
+        # 1. 验证 inject_emotion_tags 与 FishAudioTTSService.synthesize 均输出带情绪标签的 INFO 日志
+        plugin = self._build_plugin(
+            auto_voice={"mode": "always", "segment_delay_ms": 0},
+            emotion={"enabled": True, "mode": "rule", "show_injected_text": True, "send_injected_text_to_chat": True},
+        )
+        with self.assertLogs("fishaudio.test", level="INFO") as captured_plugin:
+            injected = await plugin.inject_emotion_tags("嘿嘿，快看这里！")
+        self.assertEqual(injected, "[开心的语气]嘿嘿，快看这里！")
+        self.assertTrue(any("[开心的语气]嘿嘿，快看这里！" in m for m in captured_plugin.output))
+
+        svc = FishAudioTTSService("sk-test-1234", logger=plugin.ctx.logger)
+        fake_session = MagicMock()
+        fake_session.closed = False
+        fake_session.post = MagicMock(return_value=_FakeResponse(status=200, body=b"MP3DATA"))
+        fake_session.close = AsyncMock()
+        svc._session = fake_session  # noqa: SLF001
+        with self.assertLogs("fishaudio.test", level="INFO") as captured_svc:
+            synth_res = await svc.synthesize("[开心的语气]嘿嘿，快看这里！")
+        self.assertTrue(synth_res["success"])
+        self.assertTrue(any("text=[开心的语气]嘿嘿，快看这里！" in m for m in captured_svc.output))
+        await svc.close()
+
+        # 2. 验证 send_injected_text_to_chat=True 在 auto_voice_hook 下发出带标签预览，且不会引发二次语音环回
+        async def fake_synth(text: str, **kwargs: Any) -> dict[str, Any]:
+            raw = f"AUDIO:{text}".encode("utf-8")
+            return {
+                "success": True,
+                "audio_base64": base64.b64encode(raw).decode("ascii"),
+                "audio_bytes_len": len(raw),
+                "text": text,
+            }
+
+        plugin._tts_service.synthesize = AsyncMock(side_effect=fake_synth)  # noqa: SLF001
+        res_auto = await plugin.auto_voice_hook(
+            message={"session_id": "s_preview", "raw_message": [{"type": "text", "data": "嘿嘿，快看这里！"}]},
+            set_reply=False,
+        )
+        assert res_auto is not None
+        plugin.ctx.send.text.assert_awaited_once_with("[开心的语气]嘿嘿，快看这里！", "s_preview")
+        # 预览消息再次进入 auto_voice_hook 时应命中 bypass 令牌而直接放行，不会再转成语音
+        bypassed = await plugin.auto_voice_hook(
+            message={"session_id": "s_preview", "raw_message": [{"type": "text", "data": "[开心的语气]嘿嘿，快看这里！"}]},
+            set_reply=False,
+        )
+        self.assertIsNone(bypassed)
+
+        # 3. 验证 send_voice_reply 与 voice_reply_extension 均支持 send_injected_text_to_chat
+        plugin.ctx.send.text.reset_mock()
+        res_tool = await plugin.send_voice_reply(text="嘿嘿，快看这里！", stream_id="s_tool")
+        self.assertTrue(res_tool["success"])
+        plugin.ctx.send.text.assert_awaited_once_with("[开心的语气]嘿嘿，快看这里！", "s_tool")
+
+        plugin.config.auto_voice.mode = "planner"
+        plugin.config.auto_voice.planner_temperature = 0.8
+        res_ext = await plugin.voice_reply_extension(
+            phase="before_send",
+            parameters={"use_voice": True, "suitability": 0.9},
+            messages=[{"segments": [{"type": "text", "data": "嘿嘿，快看这里！"}], "quote_previous": False}],
+        )
+        self.assertEqual(len(res_ext["messages"]), 2)
+        self.assertEqual(res_ext["messages"][0]["segments"][0]["type"], "voice")
+        self.assertEqual(res_ext["messages"][0]["segments"][0]["data"], "[开心的语气]嘿嘿，快看这里！")
+        self.assertEqual(res_ext["messages"][1]["segments"], [{"type": "text", "data": "[开心的语气]嘿嘿，快看这里！"}])
+
+    def test_split_tts_segments_and_map_annotated_preserve_tags(self) -> None:
+        # 硬切分超长带标签文本时不截断 [标签]
+        tagged_long = "[开心的语气]一二三四五六七八九十甲乙丙丁戊己庚辛"
+        segs = split_tts_segments(tagged_long, max_chars=15, split_sentences=True)
+        self.assertGreaterEqual(len(segs), 2)
+        self.assertTrue(segs[0].startswith("[开心的语气]"))
+        self.assertFalse(any("[" in s and "]" not in s for s in segs))
+
+        # 跨段映射能把上一段末尾活跃标签延续到下一段句首
+        mapped = map_annotated_to_segments(
+            ["只有每天准时收看我的视频，才能变成最可爱的企鹅。", "要是错过了，我就要对着你滚滚滚，滚滚开开！"],
+            "[平静]只有每天准时收看我的视频，才能变成最可爱的企鹅。\n要是错过了，我就要对着你[语气激动]滚滚滚，滚滚开开！",
+        )
+        self.assertEqual(
+            mapped,
+            [
+                "[平静]只有每天准时收看我的视频，才能变成最可爱的企鹅。",
+                "[平静]要是错过了，我就要对着你[语气激动]滚滚滚，滚滚开开！",
+            ],
+        )
+
+    async def test_fishaudio_command_normal_and_force_emo(self) -> None:
+        import re as _re
+
+        plugin = self._build_plugin(
+            auto_voice={"mode": "off", "segment_delay_ms": 0},
+            emotion={"enabled": False, "mode": "rule", "show_injected_text": True},
+        )
+        cmd_comp = {c["name"]: c for c in plugin.get_components()}["fishaudio"]
+        cmd_re = _re.compile(cmd_comp["metadata"]["command_pattern"])
+
+        sent_tts: list[str] = []
+
+        async def capture_synth(text: str, **kwargs: Any) -> dict[str, Any]:
+            sent_tts.append(text)
+            raw = f"CMD_AUDIO:{text}".encode("utf-8")
+            return {
+                "success": True,
+                "audio_base64": base64.b64encode(raw).decode("ascii"),
+                "audio_bytes_len": len(raw),
+                "text": text,
+            }
+
+        plugin._tts_service.synthesize = AsyncMock(side_effect=capture_synth)  # noqa: SLF001
+
+        # 1. 空参数 (/fishaudio 和 /fishaudio emo) 发出用法提示且不调用 TTS
+        for raw_empty in ("/fishaudio", "/fishaudio emo"):
+            m_empty = cmd_re.search(raw_empty)
+            assert m_empty is not None
+            ok_empty, _, intercept_empty = await plugin.handle_fishaudio_command(
+                text=raw_empty,
+                matched_groups=m_empty.groupdict(),
+                stream_id="cmd_s1",
+            )
+            self.assertFalse(ok_empty)
+            self.assertTrue(intercept_empty)
+        self.assertEqual(plugin.ctx.send.text.await_count, 2)
+        plugin._tts_service.synthesize.assert_not_awaited()  # noqa: SLF001
+
+        # 2. 不加 emo 且 emotion.enabled=False：强制转语音，但不注入情绪标签
+        raw_plain = "/fishaudio 嘿嘿，快看这里！"
+        m_plain = cmd_re.search(raw_plain)
+        assert m_plain is not None
+        ok1, _, intercept1 = await plugin.handle_fishaudio_command(
+            text=raw_plain,
+            matched_groups=m_plain.groupdict(),
+            stream_id="cmd_s1",
+        )
+        self.assertTrue(ok1)
+        self.assertTrue(intercept1)
+        self.assertEqual(sent_tts[-1], "嘿嘿，快看这里！")
+
+        # 3. 不加 emo 且 emotion.enabled=True：按设置项自动注入情绪标签并转语音
+        plugin.config.emotion.enabled = True
+        ok2, _, intercept2 = await plugin.handle_fishaudio_command(
+            text=raw_plain,
+            matched_groups=m_plain.groupdict(),
+            stream_id="cmd_s1",
+        )
+        self.assertTrue(ok2)
+        self.assertTrue(intercept2)
+        self.assertEqual(sent_tts[-1], "[开心的语气]嘿嘿，快看这里！")
+
+        # 4. 加 emo 参数且 emotion.enabled=False：强制触发情绪注入并转语音
+        plugin.config.emotion.enabled = False
+        raw_emo = f"/fishaudio emo {self.SAMPLE_PENGUIN_TEXT}"
+        m_emo = cmd_re.search(raw_emo)
+        assert m_emo is not None
+        ok3, _, intercept3 = await plugin.handle_fishaudio_command(
+            text=raw_emo,
+            matched_groups=m_emo.groupdict(),
+            stream_id="cmd_s1",
+        )
+        self.assertTrue(ok3)
+        self.assertTrue(intercept3)
+        joined_emo = "".join(sent_tts[2:])
+        self.assertIn("[开心的语气]", joined_emo)
+        self.assertIn("[平静]", joined_emo)
+        self.assertIn("[语气激动]", joined_emo)
+        self.assertIn("[哼歌]", joined_emo)
+
+        # 5. "emotion..." 单词不应误切 emo 前缀
+        text_only, force_flag = plugin._parse_fishaudio_command_args({"text": "/fishaudio emotion测试"})  # noqa: SLF001
+        self.assertEqual(text_only, "emotion测试")
+        self.assertFalse(force_flag)
 
 
 if __name__ == "__main__":

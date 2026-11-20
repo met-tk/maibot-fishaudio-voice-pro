@@ -277,13 +277,14 @@ class FishAudioTTSService:
             f"reference_id={payload.get('reference_id')}" if "reference_id" in payload else "default"
         )
         self.logger.info(
-            "Fish Audio TTS: url=%s, key=%s, model=%s, mode=%s, format=%s, body_bytes=%d",
+            "Fish Audio TTS: url=%s, key=%s, model=%s, mode=%s, format=%s, body_bytes=%d, text=%s",
             self.api_base_url,
             key_preview,
             headers["model"],
             mode_desc,
             payload["format"],
             len(body_bytes),
+            text,
         )
         return await self._do_request(body_bytes=body_bytes, headers=headers, text_content=text)
 

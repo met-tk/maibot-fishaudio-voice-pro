@@ -25,6 +25,10 @@
    - 提供两个独立的 WebUI 原生滑块：`planner_temperature`（Planner 语音温度，`0.0 - 1.0`）与 `random_probability`（纯随机概率，`0.0 - 1.0`），配合长文本按句分段发送及链接/代码块自动跳过。
 6. **可控的输出语音存储与自动清理**
    - 新增 `[storage]` 配置段：默认 `save_output_audio = false`，音频全程在内存经 Base64 传输，不在磁盘保留历史语音文件；本地 `ffmpeg` 调音临时目录亦会在处理后立即删除。若需要将生成语音留档或排查，可开启 `save_output_audio = true` 指定 `output_dir`，并通过 `auto_delete`、`retain_minutes`（含设为 `0` 时发送后立即删除）与 `max_saved_files` 控制自动清理。
+7. **情绪与语气参数自动注入（`[emotion]`）**
+   - 默认开启（`enabled = true`），在发送给 Fish Audio 合成前自动按语句语义与起伏转折在句首及句中插入 `[开心的语气]`、`[平静]`、`[语气激动]`、`[哼歌]` 等行内标签（`s1` 模型自动转为圆括号格式）。
+   - 支持三种模式：`hybrid`（默认：优先调用宿主大模型细腻标注，超时/失败无感回退本地规则）、`llm`（仅调用宿主大模型）与 `rule`（纯本地启发式规则零延迟注入）。
+   - 内置原文防篡改校验与转换文本可视机制：控制台 `INFO` 日志及语音消息元信息/WebUI 观察面板默认展示实际带 `[情绪标签]` 的转换文本（`show_injected_text = true`），失败降级发文字时仍会自动剥离标签；如需在聊天窗口边听边看标签文本，可开启 `send_injected_text_to_chat = true`。
 
 ## 目录结构
 
@@ -64,8 +68,39 @@ audio_format = "mp3"
 3. 推荐同时创建同名文本文件 `voices/default.txt`，填入参考音频中对应的准确文字台词，以提升 Fish Audio 克隆还原度。
 4. 将 `[voice].reference_id` 留空且保持 `voice_mode = "auto"`（或设为 `"clone"`），插件将自动使用 `application/msgpack` 编码发送参考音色。
 
+### 情绪与语气自动注入（`[emotion]`）
+
+插件默认开启行内情绪注入，也可以在 `config.toml` 或 MaiBot WebUI 中按需开关或微调：
+
+```toml
+[emotion]
+enabled = true
+mode = "hybrid"          # hybrid（LLM 优先 + 规则兜底） | llm | rule
+model_task = ""          # 留空使用宿主默认模型任务，也可填 utils / replyer 等
+temperature = 0.3
+timeout_seconds = 8.0
+tag_presets = "开心的语气, 平静, 语气激动, 温柔, 撒娇, 哼歌, 小声说话, 叹气, 轻笑, 疑惑, 委屈, 严肃, 俏皮, 惊讶"
+custom_instruction = ""
+skip_if_already_tagged = true
+show_injected_text = true
+send_injected_text_to_chat = false
+```
+
+开启后，例如输入原始台词：
+
+`嘿嘿，快看这里！如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！`
+
+插件会在合成前自动注入为：
+
+`[开心的语气]嘿嘿，快看这里！[平静]如果你现在还没关注臭企鹅，那你的肚子肯定会变得圆滚滚的！`
+
+并默认在插件/TTS `INFO` 日志及 WebUI 观察面板的语音文本摘要中直接展示注入后的完整内容（语音合成失败降级为纯文本时，仍会自动剥离标签仅发干净原文）；若需要直接在 QQ/微信聊天窗口查看实际转换的带标签文本，可将 `send_injected_text_to_chat` 设为 `true`。
+
 ## 暴露组件
 
+- `@Command("fishaudio")`：提供聊天强制语音转换命令：
+  - `/fishaudio <文本>`：按当前 `[emotion].enabled` 设置项决定是否注入情绪标签，并强制合成为语音发送到当前会话（不受 `[auto_voice].mode` 限制）。
+  - `/fishaudio emo <文本>`：无论 `[emotion].enabled` 是否开启，均强制执行情绪与语气自动注入后再合成为语音发送。
 - `@ReplyExtension("voice_reply")`：融入 MaiBot 原生 `reply` / `reply_supplement` 流程，在 `mode = "planner"` 时由 Planner 自行决定是否选用语音并可附带情绪风格提示；合成失败时自动无损保留原文字。
 - `@HookHandler("maisaka.planner.before_request")`（`fish_planner_voice_policy`）：在 `planner` 模式下按 `planner_temperature` 动态注入语音决策引导；在非 `planner` 模式下自动隐藏语音扩展与直发工具，避免误触发。
 - `@HookHandler("send_service.before_send")`（`fish_auto_voice`）：在 `mode = "always"` 或 `"probability"` 时按策略将出站纯文本按句/长度分段转为 `voice` 消息发送，失败自动放行纯文本；同时清理语音消息上不兼容的引用标记。
